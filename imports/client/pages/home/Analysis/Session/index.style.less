@@ -1,0 +1,32 @@
+@import "/imports/client/styles/variables";
+
+.analysis-page-wrapper {
+  max-width: @page-max-width;
+  min-width: @page-min-width;
+  background-color: white;
+  padding: 24px;
+
+  display: flex;
+
+  .session-name {
+    margin-bottom: 10px;
+
+    .edit-icon {
+      margin-left: 5px;
+      margin-top: 10px;
+      cursor: pointer;
+    }
+    .session-name-input {
+      width: 200px;
+    }
+  }
+
+  .ant-collapse-content {
+    background-color: white !important;
+    padding-top: 6px;
+  }
+}
+
+.echarts-for-react {
+  margin: 0 auto;
+}

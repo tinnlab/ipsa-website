@@ -1,0 +1,65 @@
+You are a bioinformatics expert tasked with interpreting results from an analysis.
+Given the pathway analysis results in the following tabular format:
+
+Input:
+<text value>
+
+Please interpret the given data as instructed below. Do not repeat these instructions in your response. Instead, directly provide your analysis and insights for each section:
+The data is structured as a table with columns: Database, Method, Pathway Name, Pathway ID, P-value, and Score. Here's how to interpret the data:
+1.The 'Database' column indicates the source of the pathway information (e.g., KEGG, GO biological process, GO cellular component, GO molecular function, Reactome, MitoCarta).
+2.The 'Method' column shows the analysis method used (<selectedMethods>).
+3.'Pathway Name' and 'Pathway ID' provide the name and unique identifier for each pathway.
+4.'P-value' indicates the statistical significance of the enrichment.
+5.'Score' represents the enrichment score for the pathway.
+Instructions for interpreting the results:
+1.The p-value threshold for significance is 0.05. Pathways with p-values less than 0.05 are considered significantly enriched.
+2.Higher absolute scores indicate stronger enrichment. Positive scores suggest upregulation, while negative scores suggest downregulation.
+3.Pay special attention to pathways with very low p-values and high absolute scores.
+
+1.Significant Pathway Summary:
+a) Highlight pathways that appear significant across multiple methods within each database from the following five databases: KEGG, GO biological process, GO cellular component, GO molecular function, Reactome, MitoCarta.
+b) Identify common themes among top enriched pathways across different databases.
+2.Key Biological Insights:
+a) Describe the main biological processes, molecular functions, and cellular components consistently enriched across databases.
+b) Highlight any novel or unexpected pathways that are significantly enriched.
+c) Provide in-depth analysis and exploration of the potential relationships, cross-talk, or feedback loops between the enriched pathways and their functional implications.
+d) Discuss the functional implications of the enriched pathways in the context of the biological system or condition being studied.
+3.Biological Context:
+a) Infer potential cell types, tissues, or developmental processes involved based on the enriched pathways.
+b) Suggest possible upstream regulators or key genes driving the observed enrichments. Provide a list of key genes.
+c) Explore potential downstream effects or consequences of the enriched pathways on cellular behavior or phenotype.
+4.Associated Diseases:
+a) Discuss pathways related to specific diseases. List all associated diseases.
+b) Analyze the potential role of the enriched pathways in disease pathogenesis, progression, or treatment.
+c) Identify any disease-specific pathways that could serve as biomarkers or therapeutic targets.
+5.Hypothesis Generation:
+Generate at least 5 new distinct hypotheses based on the results. For each specific hypothesis:
+a) Explain potential underlying mechanisms for the observed enrichments.
+b) Predict possible phenotypic outcomes or disease associations.
+c) Suggest novel connections between seemingly unrelated pathways.
+d) Propose potential therapeutic targets or intervention strategies.
+e) Speculate on broader physiological or evolutionary implications.
+f) Provide a brief rationale based on the data.
+g) Suggest specific experiments or analyses to test the hypothesis.
+6.Method Comparison:
+a) Compare results from different analysis methods (fgsea, ks, wilcox, ora, gsa, padog, gsea).
+b) Note consistencies and discrepancies between methods.
+c) Discuss the strengths and limitations of each method in the context of the current analysis.
+7.Limitations and Future Directions:
+a) Identify limitations in the current analysis, such as sample size, data quality, or methodological constraints.
+b) Discuss potential sources of bias or confounding factors that could influence the results.
+c) Suggest additional data or approaches to strengthen or expand these findings, such as integrating multi-omics data or performing functional validation experiments.
+d) Recommend 2-3 specific follow-up studies based on the results, outlining the objectives and expected outcomes of each proposed study.
+8.Conclusion:
+a) Summarize the main findings and their biological significance.
+b) Discuss the potential impact of these results on the field of study.
+c) Highlight the most promising avenues for future research based on the current analysis.
+
+General Instructions:
+1.Depth and Specificity: Provide a detailed and in-depth analysis for each section. Use specific examples from the data, including pathway names, p-values, and scores where relevant. Avoid general statements without supporting evidence from the results.
+2.Cross-referencing: Draw connections between different sections of your analysis. Relate findings from one section to insights in other sections to create a cohesive and interconnected analysis.
+3.Critical Thinking: Critically evaluate the results. Discuss not just what was found, but what it means in a broader context and why it might be important or unexpected.
+4.Scientific Rigor: Maintain scientific rigor throughout your analysis. Distinguish between established facts, reasonable inferences, and speculative hypotheses. Support your statements with evidence from the data where possible.
+
+Provide a detailed, well-structured response addressing each point and its sub-points thoroughly. Ensure that you explicitly address every point mentioned in the prompt without skipping or glossing over any requested components.
+Your analysis should be comprehensive, data-driven, and insightful, providing a clear understanding of the pathway analysis results and their implications.

@@ -1,0 +1,104 @@
+# Use a more specific base image
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Combine RUN commands and clean up in the same layer
+RUN apt-get update && apt-get install -y \
+    curl wget git build-essential python3 \
+    libglib2.0-0 libxext6 libsm6 libxrender1 \
+    bzip2 ca-certificates r-base \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy environment.yml file
+COPY environment.yml /tmp/environment.yml
+
+# Install Miniconda, mamba, and create conda environment
+ENV CONDA_DIR /opt/conda
+ENV PATH $CONDA_DIR/bin:$PATH
+RUN wget -qO /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-py310_23.11.0-2-Linux-$(uname -m).sh \
+    && bash /tmp/miniconda.sh -b -p $CONDA_DIR \
+    && rm /tmp/miniconda.sh \
+    && conda init bash \
+    && conda install -y -c conda-forge mamba \
+    && mamba env create -f /tmp/environment.yml \
+    && conda clean -afy
+
+# Set the shell to use the new environment
+SHELL ["conda", "run", "-n", "pathway-web", "/bin/bash", "-c"]
+
+# Create a non-root user and set up directories. Pin UID 1000 so it matches
+# `user: "1000:1000"` in docker-compose.prod.yml and the chown of the CPA_DATA_PATH host
+# bind mount — otherwise the container could run as a UID without write access to .data.
+# Some Ubuntu base images now ship a default `ubuntu` user at UID 1000; remove it first so
+# `useradd -u 1000` can't collide.
+RUN (userdel -r ubuntu 2>/dev/null || true) \
+    && useradd -m -u 1000 -s /bin/bash meteorer \
+    && mkdir -p /home/meteorer/app /home/meteorer/build \
+       /home/meteorer/app/.data/{tmp,user-data,example,tmp-upload,mitocarta} \
+    && chown -R meteorer:meteorer /home/meteorer
+
+# Switch to meteorer user
+USER meteorer
+WORKDIR /home/meteorer
+
+# Install Node.js using NVM and Meteor
+ENV NVM_DIR /home/meteorer/.nvm
+ENV NODE_VERSION 22.5.1
+ENV NODE_PATH $NVM_DIR/v$NODE_VERSION/lib/node_modules
+ENV PATH $NVM_DIR/versions/node/v$NODE_VERSION/bin:$PATH:/home/meteorer/.meteor
+
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash \
+    && . $NVM_DIR/nvm.sh \
+    && nvm install $NODE_VERSION \
+    && nvm alias default $NODE_VERSION \
+    && nvm use default \
+    && curl https://install.meteor.com/?release=3.0.1 | sh
+
+# Set up the application
+WORKDIR /home/meteorer/app
+
+# Copy package files first
+COPY --chown=meteorer:meteorer package*.json ./
+RUN bash -c "source $NVM_DIR/nvm.sh && meteor npm install"
+
+# Copy application files
+COPY --chown=meteorer:meteorer client ./client
+COPY --chown=meteorer:meteorer server ./server
+COPY --chown=meteorer:meteorer imports ./imports
+COPY --chown=meteorer:meteorer private ./private
+COPY --chown=meteorer:meteorer Prompts ./Prompts
+COPY --chown=meteorer:meteorer .meteor ./.meteor
+COPY --chown=meteorer:meteorer Rsource ./Rsource
+COPY --chown=meteorer:meteorer tests ./tests
+COPY --chown=meteorer:meteorer public ./public
+
+# antd is imported via a symlink inside imports/ (see KeggChartMultiAnalysis.jsx).
+# This dir is gitignored and must be recreated at build time, after npm install.
+RUN mkdir -p imports/node_modules_link && ln -s ../../node_modules/antd imports/node_modules_link/antd
+
+# Build the Meteor app
+RUN . $NVM_DIR/nvm.sh && meteor build --directory /home/meteorer/build --server-only
+
+# Set up the runtime environment
+WORKDIR /home/meteorer/build/bundle/programs/server
+RUN npm install
+
+# Install local R package
+USER root
+RUN R -e "install.packages('/home/meteorer/app/Rsource/modified-methods/GSA', repos = NULL, type = 'source'); if (!require('GSA')) stop('Local package installation failed')"
+
+USER meteorer
+WORKDIR /home/meteorer/build/bundle
+
+# Copy settings file
+COPY --chown=meteorer:meteorer ./config/settings.json ./settings.json
+
+# Expose the application port
+EXPOSE 3000
+
+# NOTE: DEBUG=* was removed — it enabled Express's internal `express:router`
+# logging, which floods the logs with one block per `GET /api/results` the
+# visualization page fires after each analysis. Set DEBUG to a narrow namespace
+# if app-level debug output is needed.
+CMD ["sh", "-c", "NODE_ENV=production METEOR_SETTINGS=\"$(cat settings.json)\" node main.js"]

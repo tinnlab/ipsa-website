@@ -1,0 +1,43 @@
+@import "/imports/client/styles/variables";
+
+.visualization-page-wrapper {
+  max-width: @page-max-width;
+  min-width: @page-min-width;
+  background-color: white;
+  padding: 24px;
+  display: flex;
+
+  .ant-typography {
+    display: block;
+  }
+
+  .ant-descriptions {
+    margin-bottom: 15px;
+  }
+
+  .ant-descriptions-bordered {
+    .ant-descriptions-item-label {
+      background-color: #f2f2f2;
+      border-right-color: #e8e6e6;
+    }
+
+    .ant-descriptions-item-content {
+      border-right-color: #e8e6e6;
+      vertical-align: top;
+      font-weight: 500;
+    }
+  }
+}
+
+.venntooltip {
+  position: absolute;
+  text-align: center;
+  width: 128px;
+  height: 16px;
+  background: #333;
+  color: #ddd;
+  padding: 2px;
+  border: 0px;
+  border-radius: 8px;
+  opacity: 0;
+}

@@ -1,0 +1,138 @@
+IPSA
+Copyright (c) 2026 Tin Nguyen Lab, Wayne State University
+
+This product is licensed under the MIT License (see LICENSE), EXCEPT for the
+third-party components listed below. Those components are distributed under
+their own terms and are NOT relicensed by this project's LICENSE file.
+
+
+-------------------------------------------------------------------------------
+1. Gene Set Enrichment Analysis (GSEA) R implementation
+-------------------------------------------------------------------------------
+
+Files:
+  Rsource/src/GSEA.1.0.1.R
+  Rsource/src/GSEA_para.R
+  private/R/GSEA.1.0.1.R
+  private/R/GSEA_para.R
+
+  Copyright 2003 The Broad Institute / Massachusetts Institute of Technology.
+  All rights reserved.
+
+  The original copyright notice is preserved verbatim at the top of
+  GSEA.1.0.1.R. GSEA_para.R is a parallelised adaptation of the same code.
+
+  This software is supplied without any warranty or guaranteed support
+  whatsoever. Neither the Broad Institute nor MIT can be responsible for its
+  use, misuse, or functionality.
+
+  NOT covered by this project's MIT licence. Anyone redistributing this
+  repository, or using these files beyond the terms the Broad Institute
+  grants, should obtain permission from the Broad Institute directly.
+
+
+-------------------------------------------------------------------------------
+2. GSA — Gene Set Analysis (R package)
+-------------------------------------------------------------------------------
+
+Directory:
+  Rsource/modified-methods/GSA/
+
+  GSA version 1.03.1, by Bradley Efron and Robert Tibshirani.
+  Maintainer: Rob Tibshirani <tibs@stat.stanford.edu>
+  Upstream: https://cran.r-project.org/package=GSA
+  Licence: LGPL (see Rsource/modified-methods/GSA/LICENSE)
+
+  This is a locally modified copy, installed from source at image build time
+  (Dockerfile_prod). Distributed under the LGPL, not this project's MIT licence.
+
+
+-------------------------------------------------------------------------------
+3. ECharts GL / ZRender derived visualisation code
+-------------------------------------------------------------------------------
+
+Directory:
+  imports/echarts/
+
+  Custom ECharts series adapted from ECharts GL
+  (https://github.com/ecomfe/echarts-gl).
+  Copyright (c) 2017, Baidu Inc. All rights reserved.
+  Licence: BSD 3-Clause (per the LICENSE file distributed with echarts-gl;
+  note that its package.json declares "MIT" — the LICENSE text governs).
+
+  imports/echarts/override.js additionally patches ZRender
+  (https://github.com/ecomfe/zrender), Copyright (c) 2017 Baidu Inc.,
+  BSD 3-Clause; and imports/echarts/common/PointsBuilder.js builds on ClayGL
+  (https://github.com/pissang/claygl), Copyright (c) Yi Shen, BSD 3-Clause.
+
+  Apache ECharts itself (https://echarts.apache.org) is licensed under the
+  Apache License 2.0.
+
+
+-------------------------------------------------------------------------------
+4. D3 chord-layout derived code
+-------------------------------------------------------------------------------
+
+File:
+  imports/client/components/circos-d3/index.js
+  (the customChordLayout and custom chord path-generator functions)
+
+  Derived from D3 v3 (d3.layout.chord / d3.svg.chord),
+  Copyright (c) 2010-2016, Michael Bostock. All rights reserved.
+  Licence: BSD 3-Clause. https://github.com/d3/d3
+
+
+-------------------------------------------------------------------------------
+5. react-resizable stylesheet
+-------------------------------------------------------------------------------
+
+File:
+  imports/client/styles/react-resizable.less
+
+  Adapted from the stylesheet distributed with react-resizable,
+  Copyright (c) 2016-2018 Samuel Reed. Licence: MIT.
+  https://github.com/react-grid-layout/react-resizable
+
+
+-------------------------------------------------------------------------------
+6. Bundled example expression data (NCBI GEO)
+-------------------------------------------------------------------------------
+
+Files:
+  public/files/GSE5281-expression.csv,  public/files/GSE5281-group.csv
+  public/files/GSE84422-expression.csv, public/files/GSE84422-group.csv
+  public/files/GSE48350-expression.csv, public/files/GSE48350-group.csv
+
+  Derived from public NCBI Gene Expression Omnibus (GEO) series:
+    GSE5281  — https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE5281
+    GSE84422 — https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE84422
+    GSE48350 — https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE48350
+
+  Included as example inputs. Please cite the original submitters when using
+  these datasets in published work.
+
+  The remaining sample inputs distributed with the application —
+  public/files/ora-sample.txt and public/files/pgsea-sample.tsv — are small
+  illustrative inputs shipped for demonstration purposes only; they are not
+  intended as a citable dataset.
+
+
+-------------------------------------------------------------------------------
+7. Reference data NOT included in this repository
+-------------------------------------------------------------------------------
+
+The pathway and annotation databases IPSA analyses against are downloaded at
+runtime from their upstream providers, or supplied by the operator. They are
+not redistributed here, and each carries its own terms of use:
+
+  KEGG         https://www.kegg.jp/kegg/legal.html
+  Gene Ontology  http://geneontology.org/docs/go-citation-policy/
+  Reactome     https://reactome.org/license
+  MitoCarta    https://www.broadinstitute.org/mitocarta
+               (Human.MitoCarta3.0.csv / Mouse.MitoCarta3.0.csv must be
+                obtained from the Broad Institute and placed in .data/mitocarta)
+  UniProt      https://www.uniprot.org/help/license
+  NCBI Gene    https://www.ncbi.nlm.nih.gov/home/about/policies/
+  Harmonizome  https://maayanlab.cloud/Harmonizome/about
+
+See README.md for how to provision each of these.

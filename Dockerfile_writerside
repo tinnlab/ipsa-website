@@ -1,0 +1,27 @@
+FROM registry.jetbrains.team/p/writerside/builder/writerside-builder:241.18775 as build
+
+ARG INSTANCE=Writerside/in
+
+RUN mkdir /opt/sources
+
+WORKDIR /opt/sources
+
+ADD Writerside ./Writerside
+
+RUN export DISPLAY=:99 && \
+    Xvfb :99 & \
+    /opt/builder/bin/idea.sh helpbuilderinspect -source-dir /opt/sources --product $INSTANCE --runner other --output-dir /opt/wrs-output/
+
+WORKDIR /opt/wrs-output
+
+RUN unzip webHelpIN2-all.zip -d /opt/wrs-output/unzipped-artifact
+
+# This creates a minimal container with just the static files
+FROM alpine:3.18
+
+WORKDIR /tutorial-files
+# Corrected path to match where files are actually extracted
+COPY --from=build /opt/wrs-output/unzipped-artifact/ /tutorial-files/
+
+# We'll use this as a volume mount point
+VOLUME /tutorial-files

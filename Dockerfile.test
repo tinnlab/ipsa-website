@@ -1,0 +1,44 @@
+# Lean image for running the Meteor/Mocha UNIT+INTEGRATION test suite.
+# No conda/R: the Mocha suites are pure (Bug 4 export, Bug 1 process registry,
+# Bug 2A consensus input mapping) and never invoke R. Server-only tests
+# (TEST_CLIENT=0) so no headless browser is required.
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    curl wget git build-essential python3 ca-certificates procps \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash meteorer
+USER meteorer
+WORKDIR /home/meteorer/app
+
+ENV NVM_DIR=/home/meteorer/.nvm
+ENV NODE_VERSION=22.5.1
+ENV PATH=$NVM_DIR/versions/node/v$NODE_VERSION/bin:$PATH:/home/meteorer/.meteor
+
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash \
+    && . $NVM_DIR/nvm.sh \
+    && nvm install $NODE_VERSION \
+    && nvm alias default $NODE_VERSION \
+    && curl https://install.meteor.com/?release=3.0.1 | sh
+
+# Warm the project's Meteor release dev bundle into a cached image layer.
+# Depends only on .meteor/ (release/packages), so it stays cached across source
+# edits and the test run no longer re-downloads the dev bundle each time.
+COPY --chown=meteorer:meteorer .meteor ./.meteor
+RUN bash -c "source $NVM_DIR/nvm.sh && meteor --version"
+
+# Install app dependencies (cached unless package.json changes).
+COPY --chown=meteorer:meteorer package*.json ./
+RUN bash -c "source $NVM_DIR/nvm.sh && meteor npm install"
+
+# Copy the rest of the source.
+COPY --chown=meteorer:meteorer . .
+
+# antd is imported via a gitignored symlink (see KeggChartMultiAnalysis.jsx);
+# recreate it after npm install so the bundle can resolve it.
+RUN mkdir -p imports/node_modules_link && ln -sf ../../node_modules/antd imports/node_modules_link/antd
+
+# Run server-side Mocha once and exit with its status.
+CMD bash -c "source $NVM_DIR/nvm.sh && TEST_CLIENT=0 meteor test --once --driver-package meteortesting:mocha --port 3100"

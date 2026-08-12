@@ -1,0 +1,145 @@
+# Canonical production stack for IPSA.
+# Everything configurable lives in .env (copy it from .env.example).
+#
+#   Build : docker compose -f docker-compose.prod.yml build
+#   Deploy: docker compose -f docker-compose.prod.yml up -d --remove-orphans
+#
+# `up -d` starts app + mongo, which is all you need. The optional local-LLM
+# backend requires an NVIDIA GPU and is behind the `gpu` profile:
+#
+#   docker compose -f docker-compose.prod.yml --profile gpu up -d
+#
+# Images are tagged ipsa-*:${TAG} and built locally (no registry). Roll back by
+# re-running `up -d` with an older TAG.
+
+services:
+  app:
+    image: ipsa-app:${TAG:-latest}
+    container_name: ipsa-app
+    build:
+      context: .
+      dockerfile: Dockerfile_prod
+    environment:
+      ROOT_URL: ${ROOT_URL:-http://localhost:18000}
+      MONGO_URL: mongodb://mongo:27017/meteor
+      IDMAPPING_URL: mongodb://mongo:27017/idmapping
+      PORT: 3000
+      NODE_ENV: production
+      # First boot creates this administrator. Leave ADMIN_PASSWORD unset and a random
+      # one is generated and printed once to the app log (`docker compose logs app`).
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # Optional credentials. Compose's .env only feeds interpolation in THIS file, so
+      # anything the app should read from process.env has to be listed here explicitly.
+      NCBI_API_KEY: ${NCBI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      ZOHO_CLIENT_ID: ${ZOHO_CLIENT_ID:-}
+      ZOHO_CLIENT_SECRET: ${ZOHO_CLIENT_SECRET:-}
+      ZOHO_REDIRECT_URI: ${ZOHO_REDIRECT_URI:-}
+      ZOHO_FROM_ADDRESS: ${ZOHO_FROM_ADDRESS:-}
+    user: "1000:1000"
+    ports:
+      - "${APP_PORT:-18000}:3000"
+    volumes:
+      # Optional pre-built tutorial site, served at /tutorial
+      # (server/startup/static-files.js). An empty directory is fine to start with —
+      # the in-app tutorial page then shows "File not found: index.html" until you
+      # build the site from Writerside/ and put it here.
+      - ${TUTORIAL_DIR:-./data/tutorial}:/home/meteorer/app/public/tutorial:ro
+      # User data (.data) MUST be a host volume, else uploaded expression files live only
+      # in the container's writable layer and are WIPED on every redeploy — analyses then
+      # fail with "Error in file(file, 'rt') : cannot open the connection" because the UI
+      # data (in Mongo) survives but the on-disk source file does not. The host dir must be
+      # owned by 1000:1000 (matches `user:` above).
+      #
+      # ⚠️  Seed reference data BEFORE the first `up -d`. Once this bind mount exists it
+      # shadows the image's .data, so `docker cp` from the RUNNING container would copy
+      # the empty mount. Copy from a throwaway container made off the IMAGE instead:
+      #
+      #   docker create --name ipsa-seed "ipsa-app:${TAG:-latest}"
+      #   docker cp ipsa-seed:/home/meteorer/app/.data/. ./data/app-data/
+      #   docker rm ipsa-seed
+      #
+      # The app re-creates the .data subdirs at startup (server/main.js), so an empty
+      # mount is self-healing for everything except that seeded reference data.
+      - ${CPA_DATA_PATH:-./data/app-data}:/home/meteorer/app/.data
+    # app only needs the database to boot; ollama is a runtime LLM backend it
+    # connects to lazily, so it is NOT a startup dependency (start it separately).
+    depends_on:
+      mongo:
+        condition: service_healthy
+    # Lets the app reach host-published services (e.g. an OpenAI-compatible LLM
+    # server) via http://host.docker.internal:<port> — required on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7.0.12
+    container_name: ipsa-mongo
+    command: ["--storageEngine=wiredTiger"]
+    user: "1000:1000"
+    volumes:
+      # Point CPA_DB_PATH at a different directory to switch datasets, then `up -d`.
+      # Never point two running Mongos at the same folder.
+      - ${CPA_DB_PATH:-./data/db}:/data/db
+    # Internal-only by default (app reaches it as mongo:27017 over the compose net).
+    # Uncomment to expose for debugging:
+    # ports:
+    #   - "${MONGO_PORT:-18040}:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # Optional local LLM backend. Requires an NVIDIA GPU with the container runtime
+  # configured (`docker info | grep -i runtime` should list `nvidia`) AND an existing
+  # Ollama installation bind-mounted at OLLAMA_BIN_DIR — this image does not install
+  # Ollama itself. Skip it entirely unless you want the AI features.
+  ollama:
+    profiles: ["gpu"]
+    image: ipsa-ollama:${TAG:-latest}
+    container_name: ipsa-ollama
+    build:
+      context: .
+      dockerfile: Dockerfile_ollama
+    ports:
+      - "${OLLAMA_PORT:-18020}:11434"
+    volumes:
+      - ${OLLAMA_MODELS:-./data/ollama-models}:/root/.ollama   # downloaded models
+      - ${OLLAMA_BIN_DIR:-./data/ollama-bin}:/home/ollama      # ollama binary + working dir
+    environment:
+      - MODELS=${OLLAMA_MODELS_LIST:-mistral-nemo:12b}
+      - TEST_MODEL=${OLLAMA_TEST_MODEL:-mistral-nemo:12b-65k}
+    # Uses ALL visible GPUs on the host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      sh -c "
+      cd /home/ollama &&
+      OLLAMA_HOST=0.0.0.0 OLLAMA_KEEP_ALIVE=-1 OLLAMA_NUM_PARALLEL=20 ./ollama serve &
+      echo 'Waiting for Ollama to be ready...' &&
+      until cd /home/ollama && ./ollama list >/dev/null 2>&1; do
+        echo 'Ollama is not ready - waiting'; sleep 2;
+      done &&
+      for model in $$MODELS; do
+        echo 'Pulling model: '$$model && cd /home/ollama && ./ollama pull $$model;
+      done &&
+      if [ ! -z \"$$TEST_MODEL\" ]; then
+        echo 'Creating test model: '$$TEST_MODEL &&
+        cd /home/ollama && ./ollama create $$TEST_MODEL -f /Modelfile;
+      fi &&
+      echo 'Ollama setup complete' &&
+      wait
+      "
+    restart: unless-stopped

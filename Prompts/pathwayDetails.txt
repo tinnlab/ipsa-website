@@ -1,0 +1,39 @@
+Title: Pathway Details
+
+Objective:
+Provide comprehensive information about a specific biological pathway to enhance the user's understanding of its components, functions, and significance.
+
+Input:
+<text value>
+
+Tasks:
+1. Overview:
+   a. Briefly describe the pathway and its primary biological function.
+   b. Mention the key cellular processes or physiological aspects it is involved in.
+
+2. Key Components:
+   a. List the main molecules, proteins, or genes that play crucial roles in the pathway.
+   b. Explain the function of each key component and how they interact within the pathway.
+
+3. Pathway Mechanism:
+   a. Describe the step-by-step process or cascade of events that occur within the pathway.
+   b. Explain how the different components work together to achieve the pathway's overall function.
+   c. Highlight any important regulatory mechanisms or feedback loops involved.
+
+4. Upstream and Downstream Connections:
+   a. Discuss any significant upstream pathways or cellular processes that provide input or regulate the pathway of interest.
+   b. Identify important downstream pathways or biological processes that are influenced or triggered by the pathway.
+
+5. Physiological Significance:
+   a. Explain the importance of the pathway in maintaining normal cellular or organismal function.
+   b. Discuss any known diseases, disorders, or pathological conditions associated with disruptions or abnormalities in the pathway.
+
+6. Research and Therapeutic Implications:
+   a. Highlight any notable research findings or recent advances related to the pathway.
+   b. Discuss potential therapeutic targets within the pathway and their implications for disease treatment or drug development.
+
+Output:
+Please provide a detailed and well-organized response addressing each of the tasks mentioned above.
+Use clear headings and subheadings to structure your response.
+Aim to provide a comprehensive understanding of the pathway while maintaining clarity and readability for a general scientific audience.
+Do not include any literature references in your response.

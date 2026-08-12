@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE instance-profile
+        SYSTEM "https://resources.jetbrains.com/writerside/1.0/product-profile.dtd">
+
+<instance-profile id="in"
+                 name="IPSA"
+                 start-page="Overview.md">
+
+    <toc-element topic="Overview.md"/>
+    <toc-element topic="Getting-Started.md"/>
+    <toc-element topic="How-to.md"/>
+    <toc-element topic="Data-Preparation.md"/>
+    <toc-element topic="Parameter-setting.md"/>
+    <toc-element topic="Analysis-results-and-visualization.md"/>
+    <toc-element topic="AI-Powered-Result-Interpretation.md"/>
+</instance-profile>

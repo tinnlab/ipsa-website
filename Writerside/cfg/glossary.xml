@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE terms SYSTEM "https://resources.jetbrains.com/writerside/1.0/glossary.dtd">
+<terms>
+    <term name="gene set">
+        A group of genes sharing a biological property, such as membership of a pathway
+        or an annotation term. Gene-set (or pathway) analysis tests whether such a group
+        is enriched among the genes that change between conditions.
+    </term>
+</terms>

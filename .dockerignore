@@ -1,0 +1,10 @@
+node_modules
+.meteor/local
+.git
+.vscode
+*.log
+.data
+db
+# Runtime data created by docker-compose.prod.yml — never send it to the build daemon
+data
+Dockerfile_prod

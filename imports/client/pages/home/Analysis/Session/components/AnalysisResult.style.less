@@ -1,0 +1,24 @@
+@import "/imports/client/styles/variables";
+
+.progress-wrapper {
+  .ant-progress-outer {
+    margin-right: unset;
+    padding-right: unset;
+  }
+  
+  .ant-progress-bg {
+    background: lighten(@primary-color, 20%);
+  }
+
+  .ant-progress-status-active .ant-progress-bg::before {
+    animation: ant-progress-active 2s cubic-bezier(0, 0, 0, 0) infinite;
+  }
+
+  .analysis-status {
+    width: 100%;
+    height: 32px;
+    padding: 4px;
+    color: white;
+    text-align: center;
+  }
+}

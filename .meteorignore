@@ -1,0 +1,14 @@
+**/node_modules/circos/**/*.css
+
+# E2E / Playwright tooling — keep OUT of the Meteor bundle. These files
+# require('@playwright/test') (not an app dependency) and would crash the server
+# at boot if eagerly loaded. They stay on disk for `npx playwright test`.
+/playwright.config.js
+/e2e/
+
+# Standalone Node tooling — keep OUT of the Meteor bundle for the same reason.
+# scripts/check-antd-imports.js starts with a `#!/usr/bin/env node` shebang, which is a
+# syntax error once Meteor concatenates it into the server bundle, so eagerly loading it
+# crashes the server at boot. It stays on disk for `npm run test:imports`, which runs it
+# directly with node.
+/scripts/

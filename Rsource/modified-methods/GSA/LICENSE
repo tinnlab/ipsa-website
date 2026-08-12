@@ -1,0 +1,18 @@
+GSA — Gene Set Analysis
+Copyright (c) Bradley Efron and Robert Tibshirani.
+
+Upstream: https://cran.r-project.org/package=GSA
+Licence: LGPL. The package DESCRIPTION declares "LGPL" without a version, which
+under R's conventions means any version of the GNU Lesser General Public License
+may be chosen. Full texts: https://www.gnu.org/licenses/lgpl-2.1.html and
+https://www.gnu.org/licenses/lgpl-3.0.html (see also
+https://www.r-project.org/Licenses/).
+
+MODIFICATIONS
+This directory contains a LOCALLY MODIFIED copy of GSA 1.03.1, not the
+unmodified CRAN release. R/GSA.R adds an `ncores` argument to GSA() to allow
+the permutation step to run in parallel; the upstream function has no such
+argument. No other functional changes were made.
+
+This package is distributed under the LGPL, NOT under the MIT licence that
+covers the rest of this repository. See the NOTICE file at the repository root.

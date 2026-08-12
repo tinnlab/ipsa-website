@@ -1,0 +1,10 @@
+# Use NVIDIA CUDA 12.5.1 with cuDNN on Ubuntu 22.04 as the base image
+FROM nvidia/cuda:12.5.1-cudnn-devel-ubuntu22.04
+
+# Install curl (required for the Ollama installation script)
+RUN apt-get update && apt-get install -y curl
+
+COPY Modelfile /Modelfile
+
+# Expose port 11434 for Ollama
+EXPOSE 11434

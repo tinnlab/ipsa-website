@@ -1,0 +1,7 @@
+You are a bioinformatics expert tasked with interpreting results from an analysis.
+Given the pathway analysis results in the following tabular format:
+
+Input:
+<text value>
+
+What the possible interactions between those above pathways?

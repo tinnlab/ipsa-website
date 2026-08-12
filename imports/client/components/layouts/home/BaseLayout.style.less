@@ -1,0 +1,142 @@
+@import "/imports/client/styles/variables";
+
+@menu-title-color-active : #a5cfff;
+
+.home-layout{
+  min-height: 100vh;
+
+  .header {
+    background-color: #ffffff;
+    height: 50px;
+    line-height: 50px;
+
+    display: flex;
+    color: white;
+    padding: 0 24px 0 10px;
+
+    box-shadow: rgba(0, 0, 0, 0.16) 0px 1px 4px;
+    position: relative;
+
+    .menu {
+      //background: unset;
+      color: white;
+      margin: 0 0 0 10px;
+      display: inline-block;
+      font-size: 15px;
+
+      letter-spacing: 1px;
+
+      border-bottom: unset;
+
+      .ant-menu-item {
+        a {
+          color: white;
+        }
+
+        .active {
+          color: @menu-title-color-active;
+        }
+
+        a::before{
+          bottom: 0 !important;
+        }
+
+      }
+
+      .ant-menu-submenu-title:hover{
+        color: @menu-title-color-active;
+      }
+
+      .ant-menu-submenu-open{
+        color: @menu-title-color-active;
+      }
+
+      .ant-menu-submenu, .ant-menu-item, .ant-menu-item-selected, .ant-menu-item-active{
+        border-bottom: 2px solid transparent !important;
+      }
+
+      .active{
+        color: @menu-title-color-active;
+        font-weight: 400;
+
+        .ant-menu-title-content::before{
+          content: '';
+          width: ~"calc(100% + 10px)";
+          left: -5px;
+          height: 2px;
+          background: white;
+          position: absolute;
+          top: 0;
+        }
+      }
+
+      .ant-menu-item-only-child{
+        .ant-menu-title-content::before{
+          width: ~"calc(100% - 20px)";
+          left: 10px;
+        }
+      }
+
+
+    }
+
+    .secondary-nav {
+      text-align: right;
+      display: inline-block;
+      padding-right: 20px;
+      font-size: 14px;
+      background: #2b2e39;
+      color: white;
+
+      a {
+        margin-right: 0;
+        text-decoration: none;
+        cursor: pointer;
+        position: relative;
+        color: #b1b3be;
+      }
+
+      .name {
+        width: 120px;
+        margin-right: 5px;
+        text-overflow: ellipsis;
+        overflow: hidden;
+      }
+    }
+  }
+
+  // Deliberately no padding: each routed page owns its own gutter. This wrapper used to add 24px
+  // too, which every page that sets its own then doubled to 48px.
+  .site-layout-content{
+    max-width: @page-max-width;
+    min-width: @page-min-width;
+    width: 100%;
+
+    margin: 0 auto auto;
+
+    min-height: calc(100vh - @footer-height);
+    //display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+  }
+
+  .footer{
+    height: @footer-height;
+    background: @primary-color;
+    color: white;
+  }
+}
+
+.nav-submenu-popup{
+  .ant-menu-item.active {
+    background: fade(@primary-color, 25%);;
+  }
+}
+
+.ant-layout-content {
+  background-color: #ffffff; /* Replace with your desired default background color */
+}
+
+.ant-tabs-content {
+  background-color: #ffffff; /* Replace with your desired default background color */
+}

@@ -1,0 +1,45 @@
+{
+  "domain": "http://localhost:3000",
+  "public": {
+    "appName": "IPSA",
+    "urlPrefix": "",
+    "appVersion": "1.0",
+    "fileSizeLimit": {
+      "user": 64,
+      "guest": 12
+    },
+    "fileNumberLimit": {
+      "user": 50,
+      "guest": 10
+    },
+    "GEOLimit": 100
+  },
+  "private": {
+    "RscriptCmd": "conda run -n pathway-web Rscript",
+    "RsourceDir": "/home/meteorer/app/Rsource/src",
+    "PromptDir": "/home/meteorer/app/Prompts",
+    "tempDir": "/home/meteorer/app/.data/tmp",
+    "RParallelCore": 4,
+    "userDataDir": "/home/meteorer/app/.data/user-data",
+    "exampleDataDir": "/home/meteorer/app/.data/example",
+    "tempUploadDir": "/home/meteorer/app/.data/tmp-upload",
+    "mitocartaDir": "/home/meteorer/app/.data/mitocarta",
+    "dataRetentionDays": 90,
+    "GROQ_API_KEY": "",
+    "PUBMED_EMAIL": "",
+    "PUBMED_API_KEY": "",
+    "factCheckingEnabled": true
+  },
+  "llm": {
+    "default_provider": "vllm",
+    "providers": {
+      "vllm": {
+        "baseUrl": "http://localhost:8000",
+        "model": "gpt-oss-120b",
+        "temperature": 0.2,
+        "maxTokens": 8000,
+        "useCompletionsMode": false
+      }
+    }
+  }
+}

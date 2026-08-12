@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE rules SYSTEM "https://resources.jetbrains.com/writerside/1.0/redirection-rules.dtd">
+<rules>
+    <!-- format is as follows
+    <rule id="<unique id>">
+        <accepts>page.html</accepts>
+    </rule>
+    -->
+    <rule id="1ebae80d">
+        <description>Created after removal of "Tutorial" from AIPA - AI-Powered Pathway Analyzer</description>
+        <accepts>Tutorial.html</accepts>
+    </rule>
+    <rule id="4eebc2d3">
+        <description>Created after removal of "Reference" from AIPA - AI-Powered Pathway Analyzer</description>
+        <accepts>Reference.html</accepts>
+    </rule>
+    <rule id="3e41664a">
+        <description>Created after removal of "Starter" from AIPA - AI-Powered Pathway Analyzer</description>
+        <accepts>starter.html</accepts>
+    </rule>
+</rules>

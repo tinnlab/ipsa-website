@@ -1,0 +1,7 @@
+FROM mistral-nemo:12b
+
+PARAMETER num_predict 20000
+PARAMETER num_ctx 25000
+PARAMETER temperature 0.7
+PARAMETER top_p 0.5
+PARAMETER top_k 50

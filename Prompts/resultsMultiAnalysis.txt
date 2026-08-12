@@ -1,0 +1,101 @@
+You are a bioinformatics expert tasked with comparing and interpreting results from multiple pathway analyses.
+
+Given the following input, there are only <numDatasets> analyses: <datasets>. Each analysis has been performed on a specific dataset using various methods <selectedMethods>.
+
+Input:
+<text value>
+
+It is crucial to perform a comparative analysis using the provided data for only <numDatasets> analyses: <datasets> given in the input above.
+Address the following points in details:
+
+Pathway Comparison (20% of response):
+a) Identify consistently enriched pathways across all studies.
+b) Highlight unique pathways in each study.
+c) Discuss biological implications of shared and unique pathways, including:
+    - Potential molecular interactions within and between pathways
+    - How these pathways might contribute to cellular functions or disease states
+    - Possible crosstalk between enriched pathways
+d) Analyze the direction of enrichment (up/down-regulation) for key pathways, explaining:
+How directionality might affect biological processes
+Potential consequences of opposing directionality in different studies
+
+Methodological Analysis (10% of response):
+a) Compare the performance of different enrichment methods (<selectedMethods>) across studies.
+b) Identify methods producing consistent results and those showing variability.
+c) Suggest reasons for method-specific consistencies or discrepancies, considering:
+Underlying statistical assumptions of each method
+Sensitivity to different types of biological signals
+d) Recommend best practices for pathway analysis based on these observations.
+
+Biological Insights (25% of response):
+a) Infer potential cell types, tissues, or processes involved based on enriched pathways, detailing:
+    - Specific cellular mechanisms that might be active
+    - How these mechanisms could interact in a tissue-specific context
+b) Suggest possible upstream regulators or key genes important across studies, including:
+    - Potential regulatory networks or cascades
+    - How these regulators might influence multiple pathways simultaneously
+c) Discuss how the comparison enhances our understanding of the biological context, focusing on:
+    - Emerging patterns of molecular interactions
+    - Potential feedback loops or compensatory mechanisms
+d) Analyze shared and unique disease associations across studies, exploring:
+    - Molecular mechanisms linking enriched pathways to specific diseases
+    - How pathway interactions might contribute to disease progression or phenotypes
+e) Provide a detailed description of at least one potential molecular mechanism that links multiple enriched pathways. Include:
+    - Specific genes and proteins involved
+    - Step-by-step description of the proposed mechanism
+    - How this mechanism might integrate findings from different studies
+f) Discuss how environmental factors might influence the observed pathway enrichments:
+    - Suggest at least two environmental factors that could affect the enriched pathways
+    - Explain the potential molecular basis for these environmental influences
+    - Discuss how these factors might contribute to variability in results across studies
+
+Associated Diseases Analysis (25% of response):
+a) Identify and compare disease-associated pathways across all three studies:
+    - List diseases consistently associated with enriched pathways across studies
+    - Highlight unique disease associations in each study
+b) For each major disease association, provide:
+    - A brief description of the disease and its key features
+    - The specific pathways implicated in the disease across the studies
+    - Potential molecular mechanisms linking the enriched pathways to the disease pathology
+c) Analyze any conflicting disease associations between studies:
+    - Identify pathways with opposing enrichment directions in different studies
+    - Propose explanations for these discrepancies (e.g., different disease stages, tissue specificity)
+d) Discuss how the comparative analysis of disease associations enhances our understanding of:
+    - Common molecular mechanisms underlying multiple diseases
+    - Potential comorbidities suggested by shared pathway enrichments
+    - Disease-specific molecular signatures that differentiate between conditions
+e) Suggest potential therapeutic implications based on the disease-associated pathways:
+    - Identify pathways that might serve as novel therapeutic targets
+    - Discuss how pathway directionality might inform treatment strategies
+    - Propose potential repurposing opportunities for existing drugs based on pathway similarities between diseases
+
+Hypothesis Generation (30% of response):
+Generate 5 novel, specific hypotheses based on the comparative analysis. For each hypothesis:
+a) Provide a clear, testable hypothesis statement.
+b) Explain the potential underlying mechanisms, including specific molecules or pathways involved.
+c) Predict possible phenotypic outcomes or disease associations.
+d) Suggest novel connections between seemingly unrelated pathways.
+e) Propose potential therapeutic targets or intervention strategies.
+f) Speculate on broader physiological or evolutionary implications.
+g) Provide a detailed rationale based on the data from all three studies.
+h) Suggest specific experiments or analyses to test the hypothesis, including:
+   - Molecular or cellular processes to be measured
+   - Expected outcomes and their interpretation
+   - Potential challenges in testing the hypothesis
+Ensure that your hypotheses meet the following criteria:
+1. At least one hypothesis should involve a potential feedback loop or compensatory mechanism between two or more enriched pathways.
+2. At least one hypothesis should propose a novel connection between pathways that were not previously linked.
+3. At least one hypothesis should address potential differences in results between the three studies.
+4. At least one hypothesis should suggest a potential therapeutic approach based on the pathway analysis results.
+5. Include one "high-risk, high-reward" hypothesis that makes unexpected connections across multiple pathways or studies and could lead to a significant breakthrough if correct.
+For the hypothesis involving a feedback loop or compensatory mechanism:
+i) Describe in detail how the feedback loop or compensatory mechanism might function at a molecular level.
+j) Explain how this mechanism could contribute to pathway regulation or disease processes.
+k) Discuss potential implications for treatment strategies if this hypothesis is correct.
+Your hypotheses should demonstrate creative thinking, integrate findings from multiple studies, and provide specific, testable predictions that could advance our understanding of the biological systems and diseases involved.
+
+Limitations and Future Directions:
+a) Identify limitations in the current analysis, such as sample size, data quality, or methodological constraints.
+b) Discuss potential sources of bias or confounding factors that could influence the results.
+c) Suggest additional data or approaches to strengthen or expand these findings, such as integrating multi-omics data or performing functional validation experiments.
+d) Recommend specific follow-up based on the results, outlining the objectives and expected outcomes of each propose.

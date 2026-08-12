@@ -1,0 +1,24 @@
+name: pathway-web
+channels:
+  - conda-forge
+  - defaults
+  - r
+  - bioconda
+dependencies:
+  - python=3.10
+  - r-base
+  - r-essentials
+  - r-devtools
+  - r-dplyr
+  - r-ggplot2
+  - r-rjson
+  - r-meta
+  - r-matrixstats
+  - parallel
+  - r-doparallel
+  - r-foreach
+  - bioconductor-limma
+  - bioconductor-fgsea
+  - r-biocmanager
+  - bioconductor-padog
+  - r-robustrankaggreg

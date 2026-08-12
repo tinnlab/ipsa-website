@@ -1,0 +1,22 @@
+node_modules/
+.data/
+.idea/
+.id-mapping-db
+.meteor/local
+
+# Environment variables
+.env
+
+# Runtime data created by docker-compose.prod.yml (db, uploads, tutorial site)
+/data/
+
+# Local compose overrides
+docker-compose.override.yml
+docker-compose.*.local.yml
+docker-compose.verify.yml
+
+.DS_Store
+*/node_modules_link
+./package-lock.json
+package-lock.json
+*/package-lock.json
