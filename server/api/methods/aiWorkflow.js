@@ -721,7 +721,7 @@ async function transformToExternalFormat(data) {
     metadata: metadata,
     genes,
     pathways,
-    enable_validation: false,
+    enable_validation: true,
     strict_mode: false
   };
 }
