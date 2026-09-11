@@ -14,5 +14,5 @@ unmodified CRAN release. R/GSA.R adds an `ncores` argument to GSA() to allow
 the permutation step to run in parallel; the upstream function has no such
 argument. No other functional changes were made.
 
-This package is distributed under the LGPL, NOT under the MIT licence that
+This package is distributed under the LGPL, NOT under the AGPL licence that
 covers the rest of this repository. See the NOTICE file at the repository root.

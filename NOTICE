@@ -1,9 +1,24 @@
 IPSA
 Copyright (c) 2026 Tin Nguyen Lab, Wayne State University
 
-This product is licensed under the MIT License (see LICENSE), EXCEPT for the
-third-party components listed below. Those components are distributed under
-their own terms and are NOT relicensed by this project's LICENSE file.
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+You should have received a copy of that licence along with this program (see
+LICENSE); if not, see <https://www.gnu.org/licenses/>.
+
+Because IPSA is normally operated as a network service, note section 13 of the
+AGPL: if you modify IPSA and make it available to users over a network, you
+must offer those users the Corresponding Source of your modified version.
+
+That licence covers the code in this repository EXCEPT for the third-party
+components listed below. Those components are distributed under their own terms
+and are NOT relicensed by this project's LICENSE file.
 
 
 -------------------------------------------------------------------------------
@@ -26,7 +41,7 @@ Files:
   whatsoever. Neither the Broad Institute nor MIT can be responsible for its
   use, misuse, or functionality.
 
-  NOT covered by this project's MIT licence. Anyone redistributing this
+  NOT covered by this project's AGPL licence. Anyone redistributing this
   repository, or using these files beyond the terms the Broad Institute
   grants, should obtain permission from the Broad Institute directly.
 
@@ -44,7 +59,8 @@ Directory:
   Licence: LGPL (see Rsource/modified-methods/GSA/LICENSE)
 
   This is a locally modified copy, installed from source at image build time
-  (Dockerfile_prod). Distributed under the LGPL, not this project's MIT licence.
+  (Dockerfile_prod). Distributed under the LGPL, not this project's AGPL
+  licence.
 
 
 -------------------------------------------------------------------------------

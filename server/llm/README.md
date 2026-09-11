@@ -373,4 +373,4 @@ To add a new provider:
 
 ## License
 
-Part of the IPSA project. Licensed under the MIT License; see the LICENSE and NOTICE files at the repository root.
+Part of the IPSA project. Licensed under the GNU Affero General Public License v3.0 or later; see the LICENSE and NOTICE files at the repository root.

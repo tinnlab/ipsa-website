@@ -8,8 +8,8 @@ GEO import by GSE accession, and optional LLM-assisted interpretation of results
 by the Tin Nguyen Lab at Wayne State University and is the successor to CPA (Consensus Pathway
 Analysis).
 
-Licensed under the [MIT License](LICENSE). Some bundled third-party components carry their own
-terms — see [NOTICE](NOTICE).
+Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE). Some bundled
+third-party components carry their own terms — see [NOTICE](NOTICE).
 
 ---
 
@@ -433,7 +433,13 @@ implementations. The container provides the R toolchain through the conda enviro
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-or-later — see [LICENSE](LICENSE).
+
+IPSA is free software: you may use, study, redistribute and modify it under the terms of the GNU
+Affero General Public License, version 3 or (at your option) any later version. Because IPSA is a
+network application, section 13 of that licence applies: if you run a modified IPSA and let other
+people use it over a network, you must offer those users the corresponding source of your modified
+version.
 
 Some bundled components are **not** covered by that licence and keep their own terms: the Broad
 Institute GSEA R implementation, the GSA R package (LGPL), and ECharts GL derived visualisation
