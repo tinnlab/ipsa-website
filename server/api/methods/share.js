@@ -7,15 +7,18 @@ import {collectAnalysisIds, isValidId} from '/imports/utils/ownership';
 import {
     SHARE_MODES,
     expiryFromDays,
+    fullImportLostInputs,
     isValidExpiryDays,
     isShareUsable,
 } from '/imports/utils/shareLink';
+import {caseStudyEntries} from '../../helper/caseStudies';
 import {
     resolveShareSelection,
     shareSelectionNames,
     validateShareSelection,
 } from '/imports/utils/shareSelection';
 import {cloneStudy} from '../../helper/cloneStudy';
+import {findPriorImports} from '../../helper/priorImports';
 
 // Owner-side management of share links.
 //
@@ -316,6 +319,20 @@ Meteor.methods({
                 onProgress,
             });
 
+            // A 'full' clone that copied zero files means copyUploadDir found nothing readable under
+            // the DONOR's upload path — its readdir catch swallows every error and returns
+            // {copied: 0}, so the import "succeeded" and the recipient has a study they can view but
+            // never re-run. Most often the donor study changed hands (workspace recovery moves
+            // Session.userId without moving files). Surface it here for the operator; the client
+            // warns the recipient using the same signal (counts.files, returned below).
+            if (fullImportLostInputs(share.mode, result.counts)) {
+                console.warn(
+                    `[share.import] full clone of ${share.sourceSessionId} copied 0 input files — `
+                    + `the new study ${result.sessionId} cannot be re-run. Check `
+                    + `tempUploadDir/${sourceSession.userId}/${share.sourceSessionId}`
+                );
+            }
+
             await DBCollections.StudyShare.updateAsync({_id: shareId}, {$inc: {importCount: 1}});
             await DBCollections.ShareImportProgress.updateAsync({_id: importProgressId, userId: this.userId}, {
                 $set: {stage: 'Done', percent: 100, status: 'completed', newSessionId: result.sessionId},
@@ -336,6 +353,46 @@ Meteor.methods({
             });
             throw error;
         }
+    },
+
+    // The case studies the homepage offers, as [{shareId, label}] in settings order.
+    //
+    // The client cannot read Meteor.settings.private, so this is the only way it can learn which
+    // case studies this deployment has. It returns the shareId and a label and NOTHING ELSE — never
+    // the sourceSessionId, matching share.preview's rule that a link is a capability to receive a
+    // copy, not a window into the donor study.
+    //
+    // Deliberately NOT gated on this.userId. A shareId is a public capability meant to be handed to
+    // anonymous visitors and the labels are marketing copy, so a login gate would only make the
+    // homepage race the asynchronous guest login for no benefit.
+    //
+    // The settings list is intersected with the rows that actually exist AND are usable, so a
+    // half-seeded or revoked case study disappears from the homepage instead of offering a link
+    // that fails on arrival. Removing an entry from settings hides it immediately, with no DB write.
+    async 'share.caseStudies'() {
+        const entries = caseStudyEntries();
+        if (entries.length === 0) return [];
+
+        const rows = await DBCollections.StudyShare.find(
+            {_id: {$in: entries.map((entry) => entry.shareId)}},
+            {fields: {_id: 1, neverExpires: 1, expiresAt: 1, revokedAt: 1, caseStudyLabel: 1}}
+        ).fetchAsync();
+
+        const nowMs = Date.now();
+        const usableById = new Map(
+            rows.filter((row) => isShareUsable(row, nowMs)).map((row) => [row._id, row])
+        );
+
+        // Mapped back over `entries` rather than over `rows`, so the homepage lists case studies in
+        // the order the operator wrote them rather than in Mongo's.
+        return entries
+            .filter((entry) => usableById.has(entry.shareId))
+            .map((entry) => ({
+                shareId: entry.shareId,
+                // The seeded row's label is authoritative: it already resolved a missing settings
+                // label to the study's own name.
+                label: usableById.get(entry.shareId).caseStudyLabel || entry.label || entry.shareId,
+            }));
     },
 
     // What the recipient sees BEFORE importing: enough to decide, and nothing more. Deliberately
@@ -374,6 +431,28 @@ Meteor.methods({
             throw new Meteor.Error('share-unavailable', 'The shared analyses no longer exist.');
         }
 
+        // The caller's OWN earlier copies of this study, so the page can say that importing again
+        // adds another one rather than refreshing what they have. Only their own: listing everyone's
+        // copies would disclose that other people hold them, which is the same line SESSION_PUBLIC_FIELDS
+        // draws. The donor's session id is used as the query key and never travels back.
+        //
+        // Wrapped, and deliberately so. This method has no try/catch above it, so a throw here is a
+        // 500 that makes the link permanently unopenable (tests/share-selection.tests.js:183-185),
+        // and the case-study links this route serves are handed to every visitor. A decorative table
+        // must never carry that risk, so any failure degrades to no table and leaves the preview and
+        // the import button exactly as they were.
+        let priorImports = [];
+        let priorImportsTotal = 0;
+        try {
+            ({rows: priorImports, total: priorImportsTotal} = await findPriorImports({
+                Sessions: DBCollections.Session,
+                userId: this.userId,
+                sourceSessionId: share.sourceSessionId,
+            }));
+        } catch (error) {
+            console.error('[share.preview] prior imports lookup failed:', error);
+        }
+
         return {
             studyName: session.name,
             mode: share.mode,
@@ -383,6 +462,10 @@ Meteor.methods({
             // True when the caller already owns the source study, so the UI can say so rather than
             // letting them make a pointless copy of their own work.
             isOwnStudy: share.ownerUserId === this.userId,
+            // Capped at PRIOR_IMPORT_LIMIT; the total is sent alongside so the page can say how many
+            // it is not showing rather than presenting a truncated list as a complete one.
+            priorImports,
+            priorImportsTotal,
         };
     },
 });

@@ -4,6 +4,8 @@ import assert from "assert";
 import {
     collectSubmissionSelections,
     describeSelectedSections,
+    hasGeneLevelData,
+    mandatorySections,
 } from "../imports/utils/aiSectionGating";
 import {
     indexPathwayMembership,
@@ -85,6 +87,44 @@ describe("ai wizard section gating", function () {
                 genes: [],
                 sections: { pathways: false, genes: false },
             });
+        });
+    });
+
+    // The section checkboxes are hidden: pathways are always on, and genes are on exactly when
+    // gene-level data exists, never unconditionally.
+    describe("mandatorySections", function () {
+        it("pins both sections on when gene-level data exists", function () {
+            assert.deepStrictEqual(
+                mandatorySections({ analysisIds: [ANALYSIS], genes: GENES }),
+                { pathways: true, genes: true }
+            );
+        });
+
+        it("derives genes off when the analysis has no gene-level data", function () {
+            assert.deepStrictEqual(mandatorySections({ analysisIds: [ANALYSIS], genes: {} }),
+                { pathways: true, genes: false });
+            assert.deepStrictEqual(mandatorySections({ analysisIds: [ANALYSIS], genes: { [ANALYSIS]: [] } }),
+                { pathways: true, genes: false });
+        });
+
+        it("only counts the selected analyses", function () {
+            assert.strictEqual(hasGeneLevelData(["other"], GENES), false);
+            assert.strictEqual(hasGeneLevelData(["other", ANALYSIS], GENES), true);
+        });
+
+        it("tolerates missing arguments", function () {
+            assert.deepStrictEqual(mandatorySections(), { pathways: true, genes: false });
+        });
+
+        // Pinned sections must still not claim a section the payload lacks: an emptied gene table
+        // ships no genes and is recorded as such.
+        it("still reports genes absent when the pinned selection is empty", function () {
+            const { genes, sections } = submit(
+                mandatorySections({ analysisIds: [ANALYSIS], genes: GENES }),
+                { selectedGenes: { [ANALYSIS]: [] } }
+            );
+            assert.deepStrictEqual(genes, []);
+            assert.deepStrictEqual(sections, { pathways: true, genes: false });
         });
     });
 

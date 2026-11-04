@@ -1,10 +1,19 @@
 import React from 'react';
 import { Card, Row, Col, Typography, Space, Button, Divider } from 'antd';
 import { FileTextOutlined, LineChartOutlined, TableOutlined, CheckCircleFilled } from '@ant-design/icons';
+import example from '../example';
+import useInputTypePolicy from '/imports/client/hooks/useInputTypePolicy';
 
 const { Title, Text, Paragraph } = Typography;
 
+// The 3-column (Gene / log2 Fold-Change / P-value) example, served from the same text the
+// "Use sample data" button loads. /files/pgsea-sample.tsv is single-metric, which the
+// 3-column requirement refuses.
+const PGSEA_STATS_EXAMPLE_HREF =
+    `data:text/tab-separated-values;charset=utf-8,${encodeURIComponent(example.PGSEA_3COL)}`;
+
 const Step1_InputTypeSelection = ({ selectedInputType, onSelectInputType }) => {
+    const { pgseaRequireStatsColumns } = useInputTypePolicy();
     const inputTypes = [
         {
             key: 'ora',
@@ -23,11 +32,22 @@ const Step1_InputTypeSelection = ({ selectedInputType, onSelectInputType }) => {
             title: 'PGSEA',
             fullName: 'Parametric Gene Set Enrichment Analysis',
             icon: <LineChartOutlined style={{ fontSize: 48, color: '#52c41a' }} />,
-            description: 'Analyze ranked gene lists to find pathways correlated with ranking. Best for: Pre-ranked gene lists, time-series data.',
-            format: '2-column tab-separated file: Gene ID [TAB] Ranking metric (no header)',
-            examples: [
-                { name: 'Ranked List Example', file: '/files/pgsea-sample.tsv' }
-            ],
+            // description: 'Analyze a ranked gene list with statistics to find pathways correlated with the ranking. Best for: differential-expression results (gene, log2 fold change, p-value).',
+            description: 'Analyze a ranked gene list with statistics to find pathways correlated with the ranking. Best for: differential-expression results (gene, fold change, p-value).',
+            // format: pgseaRequireStatsColumns
+            //     ? '3-column file, tab- or comma-separated, header optional: Gene ID [TAB] log2 fold change [TAB] p-value. A column of linear fold changes (all > 0, centred on 1) will be interpreted incorrectly.'
+            //     : '2 or 3 columns, tab- or comma-separated, header optional: Gene ID [TAB] log2 fold change [TAB] p-value (optional)',
+            format: pgseaRequireStatsColumns
+                ? '3-column file, tab- or comma-separated, header optional: Gene ID [TAB] fold change [TAB] p-value. The fold change can be log2 (default) or linear; you choose which on the next step.'
+                : '2 or 3 columns, tab- or comma-separated, header optional: Gene ID [TAB] fold change [TAB] p-value (optional). The fold change can be log2 (default) or linear; you choose which on the next step.',
+            examples: pgseaRequireStatsColumns
+                ? [
+                    { name: 'Ranked Gene List with Statistics Example', file: PGSEA_STATS_EXAMPLE_HREF, download: 'pgsea-stats-sample.tsv' }
+                ]
+                : [
+                    { name: 'Ranked Gene List with Statistics Example', file: PGSEA_STATS_EXAMPLE_HREF, download: 'pgsea-stats-sample.tsv' },
+                    { name: 'Single-Metric Ranked List Example', file: '/files/pgsea-sample.tsv' }
+                ],
             color: '#f6ffed'
         },
         {
@@ -120,7 +140,7 @@ const Step1_InputTypeSelection = ({ selectedInputType, onSelectInputType }) => {
                                                     size="small"
                                                     type="link"
                                                     href={example.file}
-                                                    download
+                                                    download={example.download || true}
                                                     onClick={(e) => e.stopPropagation()}
                                                     style={{ padding: 0, height: 'auto', fontSize: 12 }}
                                                 >

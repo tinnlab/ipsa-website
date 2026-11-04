@@ -19,7 +19,15 @@ import notification from "antd/lib/notification";
 // RANKING_OPTIONS now lives in /imports/utils/pgseaInput so this modal and the
 // single-analysis wizard cannot drift on wording (scripts/check-antd-imports.js fails the
 // build if either file re-declares it locally).
-import {buildPgseaContent, resolvePgseaRankingBy, RANKING_OPTIONS} from '/imports/utils/pgseaInput';
+import {
+    buildPgseaContent,
+    resolvePgseaRankingBy,
+    defaultPgseaRankingBy,
+    RANKING_OPTIONS,
+    applyPgseaFcScale,
+    resolvePgseaFcScale,
+    PGSEA_FC_SCALE_OPTIONS
+} from '/imports/utils/pgseaInput';
 import {authHeaders} from '/imports/client/utils/authHeaders';
 import {sortOrganismsByName} from '/imports/utils/organismSort';
 
@@ -954,7 +962,38 @@ const MassAnalysisModal = ({open, onCancel, sessionId, onSuccess, onShowVisualiz
         });
     };
 
+    // A dataset's declared fold-change scale: individual override → group → per-type default →
+    // log2. Shared by the pre-submit check and the submit itself so they cannot disagree.
+    const datasetFcScale = (analysis) => {
+        const groupId = Object.keys(groups).find(gid => groups[gid]?.analyses?.includes(analysis.name));
+        return resolvePgseaFcScale([
+            individualOverrides?.[analysis.name]?.fcScale,
+            groupId ? groupConfigs[groupId]?.fcScale : undefined,
+            defaultConfig?.inputTypeConfigs?.[analysis.inputType]?.fcScale,
+        ]);
+    };
+
     const handleCreateAnalyses = async () => {
+        // Refuse BEFORE switching to the progress view: a dataset declared linear with a value
+        // <= 0 cannot be converted, and the user needs to stay here to fix its scale.
+        const scaleErrors = [];
+        parsedAnalyses.forEach(analysis => {
+            if (analysis.error || analysis.inputType !== 'pgsea' || !analysis.data?.rows) return;
+            try {
+                applyPgseaFcScale(analysis.data.rows, datasetFcScale(analysis));
+            } catch (error) {
+                scaleErrors.push(`${analysis.name}: ${error.message.replace(/^PGSEA Analysis:\s*/, '')}`);
+            }
+        });
+        if (scaleErrors.length > 0) {
+            notification.error({
+                message: 'Fold-change scale does not fit the data',
+                description: scaleErrors.join('\n'),
+                duration: 0
+            });
+            return;
+        }
+
         setIsCreating(true);
         try {
             const massId = Random.id();
@@ -1048,10 +1087,19 @@ const MassAnalysisModal = ({open, onCancel, sessionId, onSuccess, onShowVisualiz
             // Bake the chosen PGSEA ranking into each analysis's 2-column `content`.
             // The backend only reads `data.content` (createPgseaParams), so the ranking
             // column must be selected here. Precedence: individual override → group
-            // config → per-input-type default → 'fc' (resolvePgseaRankingBy also clamps
-            // to what the file supports). We build a fresh array (no state mutation) and
+            // config → per-input-type default → the file's default (signed -log10(P) when it
+            // has p-values, else 'fc'; resolvePgseaRankingBy also clamps
+            // to what the file supports). `inputRaw` (the original file) is kept: the server
+            // derives the gene-level DE statistics from it. We build a fresh array (no state mutation) and
             // strip the bulky client-only fields (`rows`/`available`/`delimiter`, up to
             // ~17k rows/dataset) that the server never reads, to keep the DDP payload small.
+            //
+            // The fold-change scale resolves the same way (override → group → type default →
+            // log2), per dataset, because datasets in one study can be supplied on different
+            // scales. A linear dataset's rows are converted to log2 before `content` is built;
+            // `inputRaw` stays as uploaded and `fcScale` is stored so the server's re-parse of it
+            // (gene-level statistics) converts identically. A value <= 0 under linear stops the
+            // submission, naming the dataset and gene.
             const analysesToSubmit = parsedAnalyses.map(analysis => {
                 if (analysis.inputType !== 'pgsea' || !analysis.data?.rows) return analysis;
                 const groupId = Object.keys(groups).find(gid => groups[gid]?.analyses?.includes(analysis.name));
@@ -1060,10 +1108,18 @@ const MassAnalysisModal = ({open, onCancel, sessionId, onSuccess, onShowVisualiz
                     groupId ? groupConfigs[groupId]?.rankingBy : undefined,
                     defaultConfig?.inputTypeConfigs?.[analysis.inputType]?.rankingBy,
                 ], analysis.data.available);
-                const {rows, available, delimiter, ...restData} = analysis.data;
+                const fcScale = datasetFcScale(analysis);
+                const {rows, available, delimiter, warnings, fcAllPositive, ...restData} = analysis.data;
+                let scaledRows;
+                try {
+                    scaledRows = applyPgseaFcScale(rows, fcScale);
+                } catch (error) {
+                    throw new Error(`${analysis.name}: ${error.message.replace(/^PGSEA Analysis:\s*/, '')}`);
+                }
                 return {
                     ...analysis,
-                    data: {...restData, rankingBy: rb, content: buildPgseaContent(rows, rb)}
+                    // data: {...restData, rankingBy: rb, content: buildPgseaContent(rows, rb)}
+                    data: {...restData, rankingBy: rb, fcScale, content: buildPgseaContent(scaledRows, rb)}
                 };
             });
 
@@ -1900,7 +1956,7 @@ const MassAnalysisModal = ({open, onCancel, sessionId, onSuccess, onShowVisualiz
                                     {/* Common Fields */}
                                     <div>
                                         <Text strong style={{ fontSize: 14, marginBottom: 12, display: 'block' }}>
-                                            Common Fields Detected (appearing in 60%+ of datasets):
+                                            Common Fields Detected (present in every dataset):
                                         </Text>
                                         <Table
                                             size="small"
@@ -2322,6 +2378,7 @@ const MassAnalysisModal = ({open, onCancel, sessionId, onSuccess, onShowVisualiz
                                                                     globalOrganism={globalOrganism}
                                                                     isUngrouped={true}
                                                                     pvalAvailable={analysis.inputType === 'pgsea' && (analysis.data?.available || []).includes('pval')}
+                                                                    fcAllPositive={analysis.inputType === 'pgsea' && Boolean(analysis.data?.fcAllPositive)}
                                                                 />
                                                             </Card>
                                                         ))}
@@ -2433,6 +2490,7 @@ const MassAnalysisModal = ({open, onCancel, sessionId, onSuccess, onShowVisualiz
                                                                     globalOrganism={globalOrganism}
                                                                     isUngrouped={false}
                                                                     pvalAvailable={group.inputType === 'pgsea' && (parsedAnalyses.find(pa => pa.name === analysisName)?.data?.available || []).includes('pval')}
+                                                                    fcAllPositive={group.inputType === 'pgsea' && Boolean(parsedAnalyses.find(pa => pa.name === analysisName)?.data?.fcAllPositive)}
                                                                 />
                                                             </Card>
                                                         ))}
@@ -3075,6 +3133,12 @@ const DefaultConfigForm = ({inputType, analyses, config, onChange, databases, gl
         (analyses || []).length > 0 &&
         (analyses || []).every(a => (a.data?.available || []).includes('pval'));
 
+    // Datasets whose fold-change column, as uploaded, has no negative value — the shape a linear
+    // fold-change file has (and also an all-up-regulated log2 list, hence a prompt, not a switch).
+    const allPositiveDatasets = inputType === 'pgsea'
+        ? (analyses || []).filter(a => a.data?.fcAllPositive).map(a => a.name)
+        : [];
+
     const updateTypeConfig = (updates) => {
         const newConfig = {...config};
         if (!newConfig.inputTypeConfigs) {
@@ -3156,7 +3220,7 @@ const DefaultConfigForm = ({inputType, analyses, config, onChange, databases, gl
             {inputType === 'pgsea' && (
                 <Form.Item label="Calculate gene rankings by">
                     <Radio.Group
-                        value={typeConfig.rankingBy || 'fc'}
+                        value={typeConfig.rankingBy || defaultPgseaRankingBy(pvalAvailable ? ['fc', 'pval'] : ['fc'])}
                         onChange={(e) => updateTypeConfig({rankingBy: e.target.value})}
                     >
                         {RANKING_OPTIONS.map(opt => (
@@ -3169,6 +3233,37 @@ const DefaultConfigForm = ({inputType, analyses, config, onChange, databases, gl
                         <Text type="secondary" style={{display: 'block', fontSize: 12}}>
                             P-value ranking needs a P-value column in every dataset of this type.
                         </Text>
+                    )}
+                </Form.Item>
+            )}
+
+            {inputType === 'pgsea' && (
+                <Form.Item label="Fold-change column">
+                    <Radio.Group
+                        value={typeConfig.fcScale || 'log2'}
+                        onChange={(e) => updateTypeConfig({fcScale: e.target.value})}
+                    >
+                        {PGSEA_FC_SCALE_OPTIONS.map(opt => (
+                            <Radio key={opt.value} value={opt.value}>{opt.label}</Radio>
+                        ))}
+                    </Radio.Group>
+                    <Text type="secondary" style={{display: 'block', fontSize: 12}}>
+                        Applies to every dataset of this type unless a group or individual override says
+                        otherwise. Linear fold changes are converted to log2; the uploaded files are stored as is.
+                    </Text>
+                    {(typeConfig.fcScale || 'log2') === 'log2' && allPositiveDatasets.length > 0 && (
+                        <Alert
+                            type="warning"
+                            showIcon
+                            style={{marginTop: 8}}
+                            message={`${allPositiveDatasets.length} dataset(s) have no negative values in the fold-change column`}
+                            description={
+                                `${allPositiveDatasets.join(', ')}. These are being read as log2 fold change. If they ` +
+                                'are linear fold changes (ratios, all > 0, centred on 1), set the fold-change column to ' +
+                                'Linear here, or per dataset under Individual Overrides; if every gene is genuinely ' +
+                                'up-regulated, leave them as log2.'
+                            }
+                        />
                     )}
                 </Form.Item>
             )}
@@ -3472,7 +3567,8 @@ const GroupConfigForm = ({group, config, onChange, databases, globalOrganism, pv
         const configWithOrganism = {
             ...configWithDefaults,
             organism: globalOrganism,
-            rankingBy: configWithDefaults.rankingBy || 'fc'
+            rankingBy: configWithDefaults.rankingBy || defaultPgseaRankingBy(pvalAvailable ? ['fc', 'pval'] : ['fc']),
+            fcScale: configWithDefaults.fcScale || 'inherit'
         };
 
         form.setFieldsValue(configWithOrganism);
@@ -3481,7 +3577,7 @@ const GroupConfigForm = ({group, config, onChange, databases, globalOrganism, pv
         if (!config.methodSettings || Object.keys(config.methodSettings).length === 0) {
             onChange(configWithOrganism);
         }
-    }, [config, form, globalOrganism, supportedMethods]);
+    }, [config, form, globalOrganism, supportedMethods, pvalAvailable]);
 
     const handleFormChange = (changedFields, allFields) => {
         const newConfig = {...config};
@@ -3514,7 +3610,7 @@ const GroupConfigForm = ({group, config, onChange, databases, globalOrganism, pv
             form={form}
             layout="vertical"
             onFieldsChange={handleFormChange}
-            initialValues={{...config, organism: globalOrganism, rankingBy: config.rankingBy || 'fc'}}
+            initialValues={{...config, organism: globalOrganism, rankingBy: config.rankingBy || defaultPgseaRankingBy(pvalAvailable ? ['fc', 'pval'] : ['fc']), fcScale: config.fcScale || 'inherit'}}
         >
             <Alert
                 message={`Configuration for ${group.name}`}
@@ -3531,6 +3627,18 @@ const GroupConfigForm = ({group, config, onChange, databases, globalOrganism, pv
                             <Radio key={opt.value} value={opt.value} disabled={opt.value === 'pval' && !pvalAvailable}>
                                 {opt.label}
                             </Radio>
+                        ))}
+                    </Radio.Group>
+                </Form.Item>
+            )}
+
+            {group.inputType === 'pgsea' && (
+                // "Inherit" = the per-type default; resolvePgseaFcScale skips it.
+                <Form.Item label="Fold-change column" name="fcScale">
+                    <Radio.Group>
+                        <Radio value="inherit">Inherit</Radio>
+                        {PGSEA_FC_SCALE_OPTIONS.map(opt => (
+                            <Radio key={opt.value} value={opt.value}>{opt.label}</Radio>
                         ))}
                     </Radio.Group>
                 </Form.Item>
@@ -3633,7 +3741,8 @@ const IndividualAnalysisOverride = ({
                                         databases,
                                         globalOrganism,
                                         isUngrouped = false,
-                                        pvalAvailable = false
+                                        pvalAvailable = false,
+                                        fcAllPositive = false
                                     }) => {
     const [showOverride, setShowOverride] = useState(Object.keys(override).length > 0);
 
@@ -3743,6 +3852,34 @@ const IndividualAnalysisOverride = ({
                                 </Radio>
                             ))}
                         </Radio.Group>
+                    </div>
+                )}
+
+                {/* Fold-change scale override (PGSEA only), per dataset: datasets in one study can
+                    be supplied on different scales. "Inherit" = use group/default scale. */}
+                {inputType === 'pgsea' && (
+                    <div>
+                        <Text strong>Fold-change column: </Text>
+                        <Radio.Group
+                            style={{marginTop: 4}}
+                            value={override.fcScale || 'inherit'}
+                            onChange={(e) => {
+                                const value = e.target.value;
+                                const {fcScale, ...rest} = override;
+                                onChange(value === 'inherit' ? rest : {...override, fcScale: value});
+                            }}
+                        >
+                            <Radio value="inherit">Inherit</Radio>
+                            {PGSEA_FC_SCALE_OPTIONS.map(opt => (
+                                <Radio key={opt.value} value={opt.value}>{opt.label}</Radio>
+                            ))}
+                        </Radio.Group>
+                        {fcAllPositive && (
+                            <Text type="warning" style={{display: 'block', fontSize: 12}}>
+                                No negative values in this dataset's fold-change column. If they are linear
+                                fold changes (ratios), choose Linear.
+                            </Text>
+                        )}
                     </div>
                 )}
 

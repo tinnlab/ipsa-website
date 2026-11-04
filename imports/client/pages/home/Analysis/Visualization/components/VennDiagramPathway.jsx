@@ -13,28 +13,38 @@ import { useGlobalSettings } from "../../../../../contexts/GlobalSettingsContext
 const { Text } = Typography;
 const { Option } = Select;
 
-export default ({inputData, selectedDatasets, configs, dbId, dbName}) => {
+// The significance filter (checkbox + FDR/|Score| thresholds) is owned by the parent
+// VennDiagramPathwayChart, which filters `inputData` with it and builds the analysis picker from the
+// same result. This component only draws the controls.
+export default ({
+    inputData, selectedDatasets, configs, dbId, dbName,
+    enableSignificantFilter, setEnableSignificantFilter,
+    fdrThreshold, setFdrThreshold,
+    scoreThreshold, setScoreThreshold,
+}) => {
     const [chartInstance, setChartInstance] = useState(null);
     const [pathwayIdList, setPathwayIdList] = useState([])
     const [pathwayDetails, setPathwayDetails] = useState([])
     const [intersectLabel, setIntersectLabel] = useState([])
     const [intersectValue, setIntersectValue] = useState([])
 
-    // Get global settings
-    const { globalSettings } = useGlobalSettings();
-
-    // Filtering state - initialize from global settings
-    const [enableSignificantFilter, setEnableSignificantFilter] = useState(true)
-    const [fdrThreshold, setFdrThreshold] = useState(globalSettings.pValueFDR)
-    const [scoreThreshold, setScoreThreshold] = useState(globalSettings.enrichmentScore)
+    // This local filter state was never applied to the data (the parent filtered with its own
+    // constants), so the controls changed nothing. It now lives in the parent; see the props above.
+    // // Get global settings
+    // const { globalSettings } = useGlobalSettings();
+    //
+    // // Filtering state - initialize from global settings
+    // const [enableSignificantFilter, setEnableSignificantFilter] = useState(true)
+    // const [fdrThreshold, setFdrThreshold] = useState(globalSettings.pValueFDR)
+    // const [scoreThreshold, setScoreThreshold] = useState(globalSettings.enrichmentScore)
     const [customFdrInput, setCustomFdrInput] = useState('')
     const [customScoreInput, setCustomScoreInput] = useState('')
 
-    // Sync with global settings when they change
-    useEffect(() => {
-        setFdrThreshold(globalSettings.pValueFDR);
-        setScoreThreshold(globalSettings.enrichmentScore);
-    }, [globalSettings]);
+    // // Sync with global settings when they change
+    // useEffect(() => {
+    //     setFdrThreshold(globalSettings.pValueFDR);
+    //     setScoreThreshold(globalSettings.enrichmentScore);
+    // }, [globalSettings]);
 
     Chart.register(...registerables);
 
@@ -86,12 +96,28 @@ export default ({inputData, selectedDatasets, configs, dbId, dbName}) => {
         ctx.restore();
     };
 
-    if (inputData.length === 0) {
-        console.log('[VennDiagramPathway] Showing GeneLoading - inputData.length:', inputData.length);
-        return <GeneLoading />;
-    }
+    // An empty inputData no longer means "still loading": the parent shows PlotLoading for that, and
+    // empty now means the thresholds exclude every pathway. Returning early here would also hide the
+    // controls needed to loosen them, and it sat before the hooks below, so flipping between empty
+    // and non-empty would change the hook count.
+    // if (inputData.length === 0) {
+    //     console.log('[VennDiagramPathway] Showing GeneLoading - inputData.length:', inputData.length);
+    //     return <GeneLoading />;
+    // }
+    const hasSets = inputData.length > 0;
 
     useEffect(() => {
+        if (!hasSets) {
+            // Nothing passes the filter: drop the old chart and its selected intersection.
+            if (chartInstance) {
+                chartInstance.destroy();
+                setChartInstance(null);
+            }
+            setIntersectLabel([]);
+            setIntersectValue([]);
+            setPathwayIdList([]);
+            return;
+        }
         let filteredData = inputData.filter((data) => selectedDatasets.includes(data.analysisId));
         const handleClick = (event, elements) => {
             let pathwayLists = elements[0]?.element.$context.raw.values
@@ -373,7 +399,7 @@ export default ({inputData, selectedDatasets, configs, dbId, dbName}) => {
                         {enableSignificantFilter && (
                             <>
                                 <Text type="secondary">|</Text>
-                                <Text>FDR &lt;</Text>
+                                <Text>FDR &le;</Text>
                                 <Select
                                     value={fdrThreshold}
                                     onChange={setFdrThreshold}
@@ -408,7 +434,7 @@ export default ({inputData, selectedDatasets, configs, dbId, dbName}) => {
                                     <Option value={0.1}>0.1</Option>
                                 </Select>
                                 <Text type="secondary">|</Text>
-                                <Text>|Score| &gt;</Text>
+                                <Text>|Score| &ge;</Text>
                                 <Select
                                     value={scoreThreshold}
                                     onChange={setScoreThreshold}
@@ -452,14 +478,24 @@ export default ({inputData, selectedDatasets, configs, dbId, dbName}) => {
 
             <Divider style={{margin: '12px 0'}} />
 
-            <div className="App" style={{ height: "500px" }}>
-                <canvas id="canvasVennPathway"></canvas>
-            </div>
-            <div style={{ marginTop: "10px", marginBottom: "10px" }}>
-                <Button icon={<DownloadOutlined/>} onClick={exportPNG}>
-                    Export as PNG
-                </Button>
-            </div>
+            {hasSets ? (
+                <>
+                    <div className="App" style={{ height: "500px" }}>
+                        <canvas id="canvasVennPathway"></canvas>
+                    </div>
+                    <div style={{ marginTop: "10px", marginBottom: "10px" }}>
+                        <Button icon={<DownloadOutlined/>} onClick={exportPNG}>
+                            Export as PNG
+                        </Button>
+                    </div>
+                </>
+            ) : (
+                <Text type="secondary">
+                    {enableSignificantFilter
+                        ? `No pathways meet FDR ≤ ${fdrThreshold} and |Score| ≥ ${scoreThreshold}. Loosen the thresholds or uncheck the filter.`
+                        : 'No pathways to show.'}
+                </Text>
+            )}
             {
                 pathwayDetails.length > 0 &&
                 <>

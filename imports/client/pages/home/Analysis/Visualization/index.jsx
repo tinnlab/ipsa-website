@@ -5,7 +5,7 @@ import Tabs from "antd/lib/tabs";
 import './index.style.less'
 import Space from "antd/lib/space";
 import Collapse from "antd/lib/collapse";
-import {Alert, Descriptions, Radio, Select, TreeSelect, Table, Spin, Progress, Input, Slider, Empty} from "antd";
+import {Alert, Descriptions, Radio, Select, TreeSelect, Table, Spin, Progress, Input, Slider, Empty, Tooltip} from "antd";
 import _ from "lodash";
 import metaAnalysisUtils from "../../../../utils/metaAnalysisUtil";
 
@@ -45,7 +45,7 @@ import RankPathways from "../../../../utils/rankPathways";
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import CircosD3Chart from "./components/CircosD3Chart";
-import {LoadingOutlined, GroupOutlined, BulbOutlined} from '@ant-design/icons';
+import {LoadingOutlined, GroupOutlined, BulbOutlined, QuestionCircleOutlined, HighlightOutlined} from '@ant-design/icons';
 // import ChatWidget from "../../../../components/chat-box";
 import inViewRender from "../../../../components/in-view-render/inViewRender";
 import NavigationSidebar from "./components/NavigationSidebar";
@@ -58,19 +58,46 @@ import GeneLoading from "../../../../components/GeneLoading";
 import {resolveInitialAnalysisTab, sectionAnchorId} from "/imports/utils/vizNav";
 import {analysisDisplayName} from "/imports/utils/metaAnalysisGeneLevel";
 import {hasFunnelData, funnelEmptyStateMessage} from "/imports/utils/funnelPlotMeta";
-import {computePlotDisplayState, PLOT_STATE_MESSAGES} from "/imports/utils/plotDisplayState";
+import {
+    computePlotDisplayState,
+    computeFetchedPlotState,
+    PLOT_STATE_MESSAGES,
+} from "/imports/utils/plotDisplayState";
+import {extractMethodResults} from "/imports/utils/methodResults";
+import {selectConsensusPathwayIds} from "/imports/utils/pathwaySelection";
+import {
+    buildCircosGraph,
+    mapPathwayGenesToSymbols,
+    describeGeneSelection,
+    DEFAULT_CIRCOS_GENE_TOP_N,
+} from "/imports/utils/circosGeneSelect";
 import GlobalSettingsPanel from "./components/GlobalSettingsPanel";
 import { GlobalSettingsProvider, useGlobalSettings } from "../../../../contexts/GlobalSettingsContext";
 import MetadataTable from "./components/MetadataTable";
 import useStudyAccess from "../../../../hooks/useStudyAccess";
 import StudyAccessDenied from "../../../../components/StudyAccessDenied";
 import {isStudyAccessError} from "/imports/utils/ownership";
+// Appended at the end of the import block deliberately: PR #184 is still open and edits line 61.
+import {buildAIInterpretationLink} from "/imports/utils/aiInterpretationSelection";
+import useInputTypePolicy from "/imports/client/hooks/useInputTypePolicy";
+import {interpretationUnavailableReason} from "/imports/utils/inputTypePolicy";
+import {passesSignificance} from "/imports/utils/significanceFilter";
 
 const inputTypeNames = {
     ora: "ORA",
-    pgsea: "Pre-ranked gene list",
+    pgsea: "Ranked gene list with statistics",
     expression: "Expression"
 };
+
+// Keeps a control's label on one line. antd Space lays its children out as flex items, so a
+// label that runs out of room breaks INSIDE its own box ("Filter Significant" / "Pathways:")
+// rather than pushing the row to wrap. Pair this with `wrap` on the surrounding Space: nowrap
+// alone would just trade a broken phrase for a row that overflows horizontally.
+const CONTROL_LABEL_STYLE = {whiteSpace: 'nowrap'};
+
+// The study tabs that stay reachable however many analyses a study has. onChange already branched on
+// these three literals; naming them once means the pinning and the branching cannot drift apart.
+const PINNED_TAB_KEYS = ['meta-analysis', 'ai-powered', 'dataset-metadata'];
 
 const VolcanoChartGeneMemo = React.memo(({
                                              analysis,
@@ -186,11 +213,30 @@ export default (props) => {
     const [currentAnalysisId, setCurrentAnalysisId] = useState('');
     const [selectedDatasets, setSelectedDatasets] = useState(new Map());
     const [circosDisplayPathways, setCircosDisplayPathways] = useState(5);
+    // A TARGET, not a hard ceiling: the Circos selection raises it when needed so that every
+    // displayed pathway with a DE gene keeps one, and so highlighted genes are never dropped.
+    // The control is labelled and captioned accordingly (see the Circos tab below).
+    //
+    // Two pieces of state on purpose. `circosGeneInput` is what the field shows and may be
+    // null mid-edit (antd fires onChange(null) when the box is cleared); `circosDisplayGenes`
+    // is the committed value the charts read. Committing is debounced because antd Tabs keeps
+    // every visited pane mounted, so an uncommitted keystroke would tear down and redraw the
+    // d3 chart — reallocating a dense (P+G)² matrix — in every one of them.
+    const [circosGeneInput, setCircosGeneInput] = useState(DEFAULT_CIRCOS_GENE_TOP_N);
+    const [circosDisplayGenes, setCircosDisplayGenes] = useState(DEFAULT_CIRCOS_GENE_TOP_N);
+    const commitCircosGeneTarget = useMemo(
+        () => _.debounce((n) => setCircosDisplayGenes(n), 400),
+        []
+    );
     const [pathwayPValueFDRThres, setPathwayPValueFDRThres] = useState(0.05)
 
     // Add grouping state
     const [groupedAnalyses, setGroupedAnalyses] = useState([]);
     const [activeTabKey, setActiveTabKey] = useState(null);
+    // Which pinned panes have ever been opened. antd no longer mounts them, so this is what keeps a
+    // pane alive (hidden, not unmounted) after the user looks at something else — the same rule
+    // TabPanelList applies, and the reason switching tabs does not reset the meta-analysis builder.
+    const [mountedPinnedKeys, setMountedPinnedKeys] = useState([]);
 
     // 1. Handle tab change callback - always declared
     const handleGroupTabChange = useCallback((targetKey) => {
@@ -260,6 +306,32 @@ export default (props) => {
             return acc;
         }, {});
     }, [analyses]);
+
+    // Biological Interpretation gating (imports/utils/inputTypePolicy.js). Each analysis that
+    // cannot be interpreted is listed with its reason; the entry point is disabled only when
+    // nothing in the study can be. The AI-interpretation page and the server apply the same rules.
+    const {interpretationBlockedInputTypes} = useInputTypePolicy();
+    const interpretationGate = useMemo(() => {
+        const configById = new Map(configs.map(c => [c.analysisId, c]));
+        const unavailable = analyses
+            .map(a => ({
+                name: a.name,
+                reason: interpretationUnavailableReason({
+                    inputType: a.input || configById.get(a.id)?.inputType,
+                    hasGeneResults: configById.get(a.id)?.hasGeneResults
+                }, interpretationBlockedInputTypes)
+            }))
+            .filter(a => a.reason);
+        const nothingInterpretable = analyses.length > 0 && unavailable.length === analyses.length &&
+            (metaAnalyses || []).length === 0;
+        const reasons = _.uniq(unavailable.map(a => a.reason));
+        return {
+            unavailable,
+            disabledReason: !nothingInterpretable ? null
+                : reasons.length === 1 ? reasons[0]
+                    : 'No analysis in this study has gene-level statistics, so hypotheses cannot be grounded.'
+        };
+    }, [analyses, configs, metaAnalyses, interpretationBlockedInputTypes]);
 
     // 4.5 Get session data for metadata - always declared
     const analysesTracking = useTracker(() => {
@@ -461,8 +533,10 @@ export default (props) => {
                     </div>
                 )
             },
+            // pgsea: only when analysis.start derived gene-level rows from a fold-change +
+            // p-value upload (hasGeneResults = non-empty volcanoPlotData snapshot).
             config.inputType === "expression" ||
-            (config.inputType === "pgsea" && config.inputData?.split('\n')[0].split('\t').length === 3)
+            (config.inputType === "pgsea" && config.hasGeneResults)
                 ? {
                     key: "2",
                     label: "Gene Volcano Plot",
@@ -485,10 +559,14 @@ export default (props) => {
                     children: (
                         <div id={sectionAnchorId('circos', analysis.id)} style={{scrollMarginTop: '100px'}}>
                             <Space direction={'vertical'} style={{width: '100%'}}>
-                            <Space style={{marginBottom: '10px'}}>
-                                <Typography.Text strong>Filter DE Genes:</Typography.Text>
+                            {/* Same treatment as the pathway row below. This row is not part of
+                                the #180 regression — it has always held three groups — but it
+                                fragments identically below ~1024px, and leaving it untreated
+                                directly above a fixed row would look arbitrary. */}
+                            <Space wrap style={{marginBottom: '10px'}}>
+                                <Typography.Text strong style={CONTROL_LABEL_STYLE}>Filter DE Genes:</Typography.Text>
                                 <Space>
-                                    <Typography.Text>{'pValue.FDR ≤'}</Typography.Text>
+                                    <Typography.Text style={CONTROL_LABEL_STYLE}>{'pValue.FDR ≤'}</Typography.Text>
                                     <Input
                                         type="number"
                                         onChange={async (e) => {
@@ -498,7 +576,7 @@ export default (props) => {
                                     />
                                 </Space>
                                 <Space>
-                                    <Typography.Text>{'Absolute Log2FC ≥'}</Typography.Text>
+                                    <Typography.Text style={CONTROL_LABEL_STYLE}>{'Absolute Log2FC ≥'}</Typography.Text>
                                     <Input
                                         type="number"
                                         onChange={async (e) => {
@@ -508,11 +586,13 @@ export default (props) => {
                                     />
                                 </Space>
                             </Space>
-                            <Space>
-                                <Typography.Text strong>Filter Significant
-                                    Pathways:</Typography.Text>
+                            {/* `wrap`: this row carries four control groups, so on a narrow
+                                viewport it has to break BETWEEN groups. Without it the groups
+                                compress instead and every label fragments mid-phrase. */}
+                            <Space wrap>
+                                <Typography.Text strong style={CONTROL_LABEL_STYLE}>Filter Significant Pathways:</Typography.Text>
                                 <Space>
-                                    <Typography.Text>{'pValue.FDR ≤'}</Typography.Text>
+                                    <Typography.Text style={CONTROL_LABEL_STYLE}>{'pValue.FDR ≤'}</Typography.Text>
                                     <Input
                                         type={"number"}
                                         onChange={(e) => {
@@ -522,8 +602,7 @@ export default (props) => {
                                     />
                                 </Space>
                                 <Space>
-                                    <Typography.Text>Number of pathways
-                                        to display:</Typography.Text>
+                                    <Typography.Text style={CONTROL_LABEL_STYLE}>Number of pathways to display:</Typography.Text>
                                     <Input
                                         type="number"
                                         onChange={(e) => {
@@ -536,6 +615,36 @@ export default (props) => {
                                         value={circosDisplayPathways}
                                     />
                                 </Space>
+                                <Space>
+                                    <Typography.Text style={CONTROL_LABEL_STYLE}>Target number of genes:</Typography.Text>
+                                    {/* InputNumber, not the neighbouring `Input type="number"`:
+                                        that one clamps with `e.target.value <= 0`, which is also
+                                        true for the empty string, and lets "abc" through to
+                                        `slice(0, "abc")`. Here min/max bound the committed value
+                                        and normalizeGeneCap guards the util regardless.
+                                        The field keeps whatever the user typed — including the
+                                        empty box antd reports as null — and only a usable number
+                                        is committed, so clearing to retype does not snap to 1. */}
+                                    <InputNumber
+                                        min={1}
+                                        max={2000}
+                                        value={circosGeneInput}
+                                        onChange={(v) => {
+                                            setCircosGeneInput(v);
+                                            if (typeof v === 'number' && v >= 1) {
+                                                commitCircosGeneTarget(Math.floor(v));
+                                            }
+                                        }}
+                                        style={{width: 90}}
+                                    />
+                                    <Tooltip
+                                        title={'A target, not a hard limit. Genes are ranked by pValue.FDR, but the plot will show more than the target when it needs to: highlighted genes are never dropped, and every displayed pathway that has a differentially expressed gene keeps at least one. The caption under each plot says when that happened.'}
+                                    >
+                                        {/* tabIndex so the explanation is reachable by keyboard —
+                                            this control's correctness depends on it being read. */}
+                                        <QuestionCircleOutlined style={{color: '#8c8c8c'}} tabIndex={0}/>
+                                    </Tooltip>
+                                </Space>
                             </Space>
                             <CircosTabs
                                 sessionId={sessionId}
@@ -546,6 +655,7 @@ export default (props) => {
                                 setCurrentMethod={setCurrentMethod}
                                 handleChangingDESettings={handleChangingDESettings}
                                 circosDisplayPathways={circosDisplayPathways}
+                                circosDisplayGenes={circosDisplayGenes}
                                 pathwayPValueFDRThres={pathwayPValueFDRThres}
                             />
                         </Space>
@@ -699,7 +809,7 @@ export default (props) => {
                 )
             }
         ].filter(item => item !== null);
-    }, [sessionId, selectedDatasets, handleScatterPointClick, currentMethod, setCurrentMethod, handleChangingDESettings, circosDisplayPathways, pathwayPValueFDRThres, analysesObj]);
+    }, [sessionId, selectedDatasets, handleScatterPointClick, currentMethod, setCurrentMethod, handleChangingDESettings, circosDisplayPathways, circosDisplayGenes, circosGeneInput, commitCircosGeneTarget, pathwayPValueFDRThres, analysesObj]);
 
     // 9. Create ALL tab items in one stable useMemo - always declared
     const allTabItems = useMemo(() => {
@@ -1096,9 +1206,9 @@ export default (props) => {
             const currentConfig = configs.find(c => c.analysisId === currentAnalysisId);
 
             if (currentConfig) {
-                // Gene Volcano Plot (for expression or pgsea with 3 columns)
+                // Gene Volcano Plot (for expression, or pgsea whose upload carried gene-level statistics)
                 if (currentConfig.inputType === "expression" ||
-                    (currentConfig.inputType === "pgsea" && currentConfig.inputData?.split('\n')[0].split('\t').length === 3)) {
+                    (currentConfig.inputType === "pgsea" && currentConfig.hasGeneResults)) {
                     sections.push({id: anchor('gene-volcano'), title: 'Gene Volcano Plot'});
                 }
 
@@ -1195,6 +1305,444 @@ export default (props) => {
     });
 
 
+    // One handler for both bars. Its body is the tab bar's previous inline onChange, unchanged:
+    // it still branches on the three literal keys, on the `group_` prefix, and on a numeric key
+    // parsed as `parseInt(key) - 1` into groupingData.regularAnalyses. Nothing here renumbers or
+    // reorders anything, which is what would break analysis selection silently.
+    // A plain function, deliberately not useCallback: this sits below the component's early returns
+    // (accessDenied, and the not-yet-loaded guard), so a hook here would be a conditional hook and
+    // React would throw "rendered more hooks than during the previous render" the moment the data
+    // arrived. It was an inline arrow before this change, recreated on every render, so a plain
+    // function is exactly the previous behaviour.
+    const handleTabChange = async key => {
+        console.log('[TAB-CHANGE] Switching to:', key);
+        setActiveTabKey(key);
+        // First activation mounts that pane; after that it is only ever shown or hidden. Analysis
+        // tabs are not recorded — antd still owns their panes.
+        if (PINNED_TAB_KEYS.includes(key)) {
+            setMountedPinnedKeys(prev => (prev.includes(key) ? prev : [...prev, key]));
+        }
+
+        if (key === "meta-analysis") {
+            console.log('[TAB-CHANGE] Meta-analysis tab clicked');
+            // Only fetch if data hasn't been loaded yet
+            if (Object.keys(resultGroupedDbAll).length === 0) {
+                console.log('[TAB-CHANGE] Fetching data...');
+                await handleFetchResultGroupedByDbAll();
+                console.log('[TAB-CHANGE] Data fetch completed');
+            } else {
+                console.log('[TAB-CHANGE] Data already loaded, skipping fetch');
+            }
+        }
+        if (key !== 'meta-analysis' && key !== 'ai-powered' && key !== 'dataset-metadata') {
+            // Check if this is a group key
+            if (key.startsWith('group_')) {
+                const groupId = key.replace('group_', '');
+                const group = groupingData.groupedMassAnalysesForTabs.find(g => g.groupId === groupId);
+                if (group && group.analyses.length > 0) {
+                    // Select the first analysis in the group
+                    const firstAnalysis = group.analyses[0];
+                    setCurrentAnalysisId(firstAnalysis.id);
+                }
+            } else {
+                // Regular analysis selection (including ungrouped mass analyses)
+                const analysisIndex = parseInt(key) - 1;
+                if (analysisIndex >= 0 && analysisIndex < groupingData.regularAnalyses.length) {
+                    setCurrentAnalysisId(groupingData.regularAnalyses[analysisIndex].id);
+                }
+            }
+        }
+    };
+
+    // The three tabs that stay put. They are pinned by being taken OUT of the scrolling bar
+    // entirely: rc-tabs derives its visible range from measured tab geometry, so a tab that is
+    // hidden or unrendered while still listed in `items` reports zero width at offset zero, and once
+    // the bar is scrolled that drives useVisibleRange to [0, -1] — every tab vanishes. Extracting
+    // them here, unchanged, is what lets the bar below carry them as extra content instead.
+    const pinnedTabItems = [
+        hasMetaAnalysisCapability(configs, analyses) ?
+            {
+                // A meta-analysis combines datasets, so one analysis has nothing to combine.
+                // Disabled rather than hidden, matching Dataset Metadata: the tab stays visible
+                // so the capability is discoverable, it just cannot be opened. Safe to disable
+                // even when it would otherwise be the landing tab, because pinned panes only
+                // mount once their tab is clicked (see mountedPinnedKeys in handleTabChange).
+                disabled: !(dataLoaded) || analyses.length < 2,
+                icon: !(dataLoaded) ? <LoadingOutlined/> : null,
+                label: `Meta-analysis${!(dataLoaded) ? ' (Loading...)' : ''}`,
+                key: "meta-analysis",
+                children: (
+                    <Collapse
+                        bordered={false}
+                        defaultActiveKey={["1", "2", "3", "3.5", "4", "5", "6", "7", "8"]}
+                        key={"meta-analysis"}
+                        items={
+                            [
+                                {
+                                    key: "1",
+                                    label: "Meta-analysis",
+                                    children: (
+                                        <div id="meta-builder" style={{scrollMarginTop: '100px'}}>
+                                            <MetaAnalysisBuilder
+                                                configs={configs}
+                                                analyses={analysesObj}
+                                                sessionId={sessionId}
+                                                resultGroupedDbAll={resultGroupedDbAll}
+                                            />
+                                        </div>
+                                    )
+                                },
+                                // Gene Venn Diagram: gene-level, so only shown
+                                // when there are gene-level meta-analyses.
+                                ...(DEMetaResults.length > 0 ? [{
+                                    key: "2",
+                                    label: "Gene Venn Diagram",
+                                    children: (
+                                        <div id="meta-venn" style={{scrollMarginTop: '100px'}}>
+                                            <InViewVennDiagramChart
+                                                configs={configs}
+                                                analyses={analysesObj}
+                                                metaAnalysis={DEMetaResults}
+                                                sessionId={sessionId}
+                                            />
+                                        </div>
+                                    )
+                                }] : []),
+                                // Gene Heatmap: gene-level, so only shown when
+                                // there are gene-level meta-analyses.
+                                ...(DEMetaResults.length > 0 ? [{
+                                    key: "3",
+                                    label: "Gene Heatmap",
+                                    children: (
+                                        <div id="meta-gene-heatmap" style={{scrollMarginTop: '100px'}}>
+                                            <InViewHeatmapGeneChart
+                                                configs={configs}
+                                                analyses={analysesObj}
+                                                metaData={DEMetaResults}
+                                                sessionId={sessionId}
+                                            />
+                                        </div>
+                                    )
+                                }] : []),
+                                {
+                                    key: "3.5",
+                                    label: "Pathway Venn Diagram",
+                                    children: (
+                                        <div id="meta-pathway-venn" style={{scrollMarginTop: '100px'}}>
+                                            <Tabs
+                                                defaultActiveKey="0"
+                                                type={"card"}
+                                                onChange={(activeKey) => {
+                                                }}
+                                                items={
+                                                    Object.keys(dbsObj)
+                                                        .filter(key => resultGroupedDbAll[key] && resultGroupedDbAll[key].length > 0)
+                                                        .map((key) => {
+                                                            return {
+                                                                label: dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : ""),
+                                                                key: key,
+                                                                children: (
+                                                                    <InViewVennDiagramPathwayChart
+                                                                        configs={configs}
+                                                                        analyses={analysesObj}
+                                                                        analysisResultsByDb={resultGroupedDbAll[key] || []}
+                                                                        dbId={key}
+                                                                        dbName={dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : "")}
+                                                                        metaData={pathwayMetaResults}
+                                                                        metaAnalyses={metaAnalyses}
+                                                                    />
+                                                                )
+                                                            }
+                                                        })
+                                                }
+                                            />
+                                        </div>
+                                    )
+                                },
+                                {
+                                    key: "4",
+                                    label: "Multi Analysis KEGG Map",
+                                    children: (
+                                        <div id="meta-kegg" style={{scrollMarginTop: '100px'}}>
+                                            <InViewKEGGMapMultiAnalysis
+                                                configs={configs}
+                                                analyses={analysesObj}
+                                                metaData={DEMetaResults}
+                                                sessionId={sessionId}
+                                            />
+                                        </div>
+                                    )
+                                },
+                                {
+                                    key: "5",
+                                    label: "Pathway Heatmap",
+                                    children: (
+                                        <div id="meta-pathway-heatmap" style={{scrollMarginTop: '100px'}}>
+                                            <Tabs
+                                                defaultActiveKey="0"
+                                                type={"card"}
+                                                onChange={(activeKey) => {
+                                                }}
+                                                items={
+                                                (() => {
+                                                    const allDbKeys = Object.keys(dbsObj);
+                                                    const filtered = allDbKeys.filter(key => resultGroupedDbAll[key] && resultGroupedDbAll[key].length > 0);
+                                                    console.log("[DEBUG Pathway Heatmap] All db keys:", allDbKeys, "Filtered db keys:", filtered);
+                                                    return filtered;
+                                                })()
+                                                    .map((key) => {
+                                                    return {
+                                                        label: dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : ""),
+                                                        key: key,
+                                                        children: (
+                                                            <InViewHeatMapChartTable
+                                                                analyses={analysesObj}
+                                                                configs={configs}
+                                                                dbId={key}
+                                                                metaData={pathwayMetaResults}
+                                                                metaAnalyses={metaAnalyses}
+                                                                sessionId={sessionId}
+                                                                analysisResultsByDb={resultGroupedDbAll[key] || []}
+                                                                setAnalyses={setAnalyses}
+                                                            >
+                                                            </InViewHeatMapChartTable>
+                                                        )
+                                                    }
+                                                })
+                                            }
+                                        />
+                                        </div>
+                                    )
+                                },
+                                {
+                                    key: "6",
+                                    label: "Funnel Plot",
+                                    children: (() => {
+                                        // A funnel plot needs a standard error, which only REML produces.
+                                        // Show a tab only for databases that actually have plottable funnel
+                                        // data; if none do, show the explanatory hint once instead of
+                                        // empty tabs (see funnelPlotMeta.js).
+                                        const funnelDbKeys = Object.keys(dbsObj)
+                                            .filter(key => resultGroupedDbAll[key] && resultGroupedDbAll[key].length > 0)
+                                            .filter(key => hasFunnelData((pathwayMetaResults || []).filter(m => m && m.databaseId === key)))
+                                        return (
+                                            <div id="meta-funnel" style={{scrollMarginTop: '100px'}}>
+                                                {funnelDbKeys.length === 0 ? (
+                                                    <div style={{padding: '20px', textAlign: 'center'}}>
+                                                        <Empty description={funnelEmptyStateMessage(pathwayMetaResults || [])} />
+                                                    </div>
+                                                ) : (
+                                                    <Tabs
+                                                        defaultActiveKey="0"
+                                                        type={"card"}
+                                                        onChange={(activeKey) => {
+                                                        }}
+                                                        items={
+                                                        funnelDbKeys.map((key) => {
+                                                            return {
+                                                                label: dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : ""),
+                                                                key: key,
+                                                                children: (
+                                                                    <InViewFunnelPlotChartTable
+                                                                        analyses={analysesObj}
+                                                                        configs={configs}
+                                                                        dbId={key}
+                                                                        metaData={pathwayMetaResults}
+                                                                        metaAnalyses={metaAnalyses}
+                                                                        sessionId={sessionId}
+                                                                        analysisResultsByDb={resultGroupedDbAll[key] || []}
+                                                                    ></InViewFunnelPlotChartTable>
+                                                                )
+                                                            }
+                                                        })
+                                                    }
+                                                    />
+                                                )}
+                                            </div>
+                                        )
+                                    })()
+                                },
+                                {
+                                    key: "7",
+                                    label: "Multi Analysis Forest Plot",
+                                    children: (
+                                        <div id="meta-forest" style={{scrollMarginTop: '100px'}}>
+                                            <Tabs
+                                                defaultActiveKey="0"
+                                                type={"card"}
+                                                onChange={(activeKey) => {
+                                                }}
+                                                items={
+                                                Object.keys(dbsObj)
+                                                    .filter(key => resultGroupedDbAll[key] && resultGroupedDbAll[key].length > 0)
+                                                    .map((key) => {
+                                                    return {
+                                                        label: dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : ""),
+                                                        key: key,
+                                                        children: (
+                                                            <InViewMultiForestChart
+                                                                analyses={analysesObj}
+                                                                configs={configs}
+                                                                dbId={key}
+                                                                metaData={pathwayMetaResults}
+                                                                metaAnalyses={metaAnalyses}
+                                                                sessionId={sessionId}
+                                                                analysisResultsByDb={resultGroupedDbAll[key] || []}
+                                                            ></InViewMultiForestChart>
+                                                        )
+                                                    }
+                                                })
+                                            }
+                                        />
+                                        </div>
+                                    )
+                                },
+                                {
+                                    key: "8",
+                                    label: "Multi Analysis Pathway Network",
+                                    children: (
+                                        <div id="meta-pathway-network" style={{scrollMarginTop: '100px'}}>
+                                            <Tabs
+                                                defaultActiveKey="0"
+                                                type={"card"}
+                                                onChange={(activeKey) => {
+                                                }}
+                                                items={
+                                                Object.keys(dbsObj)
+                                                    .filter(key => resultGroupedDbAll[key] && resultGroupedDbAll[key].length > 0)
+                                                    .map((key) => {
+                                                    return {
+                                                        label: dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : ""),
+                                                        key: key,
+                                                        children: (
+                                                            <InViewMultiAnalysisPathwayGraphComponentTable
+                                                                analyses={analysesObj}
+                                                                configs={configs}
+                                                                dbId={key}
+                                                                metaData={pathwayMetaResults}
+                                                                metaAnalyses={metaAnalyses}
+                                                                sessionId={sessionId}
+                                                                analysisResultsByDb={resultGroupedDbAll[key] || []}
+                                                            />
+                                                        )
+                                                    }
+                                                })
+                                            }
+                                        />
+                                        </div>
+                                    )
+                                },
+                            ]
+                        }
+                    />
+                )
+            } : null,
+        {
+            label: "Biological Interpretation",
+            key: "ai-powered",
+            disabled: analyses.length === 0,
+            icon: !(dataLoaded) ? <LoadingOutlined/> : null,
+            children: (
+                <Space direction="vertical" size="middle" style={{width: '100%'}}>
+                    <Space size="middle" wrap>
+                        <Tooltip title={interpretationGate.disabledReason || ''}>
+                        <Button
+                            type="primary"
+                            icon={<BulbOutlined/>}
+                            disabled={Boolean(interpretationGate.disabledReason)}
+                            onClick={() => {
+                                // The generation wizard lives on the
+                                // AI-interpretation page, so carry the study
+                                // across and let the user pick which analysis
+                                // to interpret there. urlPrefix matters: the
+                                // route is registered as `${urlPrefix}/ai-interpretation`.
+                                navigate(`${urlPrefix}/ai-interpretation${buildAIInterpretationLink({sessionId})}`);
+                            }}
+                        >
+                            Generate Insight
+                        </Button>
+                        </Tooltip>
+                        <Typography.Text type="secondary">
+                            Opens the Biological Interpretation page to configure and run a new report.
+                        </Typography.Text>
+                    </Space>
+                    {(interpretationGate.disabledReason || interpretationGate.unavailable.length > 0) && (
+                        <Alert
+                            type={interpretationGate.disabledReason ? "warning" : "info"}
+                            showIcon
+                            message={interpretationGate.disabledReason
+                                ? "Biological Interpretation is not available for this study"
+                                : "Some analyses in this study cannot be interpreted"}
+                            description={
+                                <ul style={{margin: 0, paddingLeft: 20}}>
+                                    {interpretationGate.unavailable.map(({name, reason}) => (
+                                        <li key={name}><strong>{name}</strong>: {reason}</li>
+                                    ))}
+                                </ul>
+                            }
+                        />
+                    )}
+                    <Collapse
+                        bordered={false}
+                        defaultActiveKey={["1"]}
+                        key={"ai-powered"}
+                        items={
+                            [
+                                {
+                                    key: "1",
+                                    label: "Generated Reports",
+                                    children: (
+                                        <InsightDashboard
+                                            userId={Meteor.userId()}
+                                            sessionId={sessionId}
+                                            onViewInsight={(batchId) => {
+                                                // The report has an address now,
+                                                // so this lands on the report
+                                                // itself. It used to receive the
+                                                // batchId, discard it, and
+                                                // full-reload the whole app onto
+                                                // the bare list, leaving the user
+                                                // to find the report again by
+                                                // hand. navigate, not
+                                                // window.location.href: the rest
+                                                // of the app routes in-place.
+                                                // The study id rides along so the
+                                                // target page can scope itself
+                                                // without a second lookup. No
+                                                // fromList state — the entry
+                                                // underneath is THIS page, which
+                                                // is exactly where Back belongs.
+                                                navigate(`${urlPrefix}/ai-interpretation${buildAIInterpretationLink({sessionId, reportId: batchId})}`);
+                                            }}
+                                            analyses={analysesObj}
+                                            metaAnalyses={metaAnalyses}
+                                        />
+                                    )
+                                }
+                            ]
+                        }
+                    />
+                </Space>
+            )
+        },
+        {
+            label: "Dataset Metadata",
+            key: "dataset-metadata",
+            disabled: Object.keys(analysesMetadata).length === 0,
+            children: (
+                <MetadataTable
+                    analysesMetadata={analysesMetadata}
+                    sessionId={sessionId}
+                />
+            )
+        }
+    ].filter(item => item !== null);
+
+    // The same three as bar entries only: no `children`, because their panes are rendered below the
+    // Tabs rather than by it.
+    const pinnedBarItems = pinnedTabItems.map(({key, label, disabled, icon}) => ({key, label, disabled, icon}));
+
+
     return (
         <GlobalSettingsProvider sessionId={sessionId}>
             <Layout className={'visualization-page-wrapper'}>
@@ -1245,379 +1793,42 @@ export default (props) => {
                                 }}
                             </DefaultTabBar>
                         )}
-                        onChange={async key => {
-                            console.log('[TAB-CHANGE] Switching to:', key);
-                            setActiveTabKey(key);
-
-                            if (key === "meta-analysis") {
-                                console.log('[TAB-CHANGE] Meta-analysis tab clicked');
-                                // Only fetch if data hasn't been loaded yet
-                                if (Object.keys(resultGroupedDbAll).length === 0) {
-                                    console.log('[TAB-CHANGE] Fetching data...');
-                                    await handleFetchResultGroupedByDbAll();
-                                    console.log('[TAB-CHANGE] Data fetch completed');
-                                } else {
-                                    console.log('[TAB-CHANGE] Data already loaded, skipping fetch');
-                                }
-                            }
-                            if (key !== 'meta-analysis' && key !== 'ai-powered' && key !== 'dataset-metadata') {
-                                // Check if this is a group key
-                                if (key.startsWith('group_')) {
-                                    const groupId = key.replace('group_', '');
-                                    const group = groupingData.groupedMassAnalysesForTabs.find(g => g.groupId === groupId);
-                                    if (group && group.analyses.length > 0) {
-                                        // Select the first analysis in the group
-                                        const firstAnalysis = group.analyses[0];
-                                        setCurrentAnalysisId(firstAnalysis.id);
-                                    }
-                                } else {
-                                    // Regular analysis selection (including ungrouped mass analyses)
-                                    const analysisIndex = parseInt(key) - 1;
-                                    if (analysisIndex >= 0 && analysisIndex < groupingData.regularAnalyses.length) {
-                                        setCurrentAnalysisId(groupingData.regularAnalyses[analysisIndex].id);
-                                    }
-                                }
-                            }
+                        onChange={handleTabChange}
+                        tabBarExtraContent={{
+                            // Pinned by construction: rc-tabs measures the extra holders and
+                            // SUBTRACTS them from the scrollable width, so this bar is never part of
+                            // the overflow calculation no matter how many analyses the study has.
+                            // Still an antd Tabs, so the card styling, the aria roles and arrow-key
+                            // navigation all come from antd rather than from hand-rolled divs.
+                            right: (
+                                <Tabs
+                                    type={"card"}
+                                    className={"viz-pinned-tabs"}
+                                    activeKey={activeTabKey}
+                                    onChange={handleTabChange}
+                                    items={pinnedBarItems}
+                                />
+                            )
                         }}
                         activeKey={activeTabKey}
-                        items={[...allTabItems,
-                            hasMetaAnalysisCapability(configs, analyses) ?
-                                {
-                                    disabled: !(dataLoaded),
-                                    icon: !(dataLoaded) ? <LoadingOutlined/> : null,
-                                    label: `Meta-analysis${!(dataLoaded) ? ' (Loading...)' : ''}`,
-                                    key: "meta-analysis",
-                                    children: (
-                                        <Collapse
-                                            bordered={false}
-                                            defaultActiveKey={["1", "2", "3", "3.5", "4", "5", "6", "7", "8"]}
-                                            key={"meta-analysis"}
-                                            items={
-                                                [
-                                                    {
-                                                        key: "1",
-                                                        label: "Meta-analysis",
-                                                        children: (
-                                                            <div id="meta-builder" style={{scrollMarginTop: '100px'}}>
-                                                                <MetaAnalysisBuilder
-                                                                    configs={configs}
-                                                                    analyses={analysesObj}
-                                                                    sessionId={sessionId}
-                                                                    resultGroupedDbAll={resultGroupedDbAll}
-                                                                />
-                                                            </div>
-                                                        )
-                                                    },
-                                                    // Gene Venn Diagram: gene-level, so only shown
-                                                    // when there are gene-level meta-analyses.
-                                                    ...(DEMetaResults.length > 0 ? [{
-                                                        key: "2",
-                                                        label: "Gene Venn Diagram",
-                                                        children: (
-                                                            <div id="meta-venn" style={{scrollMarginTop: '100px'}}>
-                                                                <InViewVennDiagramChart
-                                                                    configs={configs}
-                                                                    analyses={analysesObj}
-                                                                    metaAnalysis={DEMetaResults}
-                                                                    sessionId={sessionId}
-                                                                />
-                                                            </div>
-                                                        )
-                                                    }] : []),
-                                                    // Gene Heatmap: gene-level, so only shown when
-                                                    // there are gene-level meta-analyses.
-                                                    ...(DEMetaResults.length > 0 ? [{
-                                                        key: "3",
-                                                        label: "Gene Heatmap",
-                                                        children: (
-                                                            <div id="meta-gene-heatmap" style={{scrollMarginTop: '100px'}}>
-                                                                <InViewHeatmapGeneChart
-                                                                    configs={configs}
-                                                                    analyses={analysesObj}
-                                                                    metaData={DEMetaResults}
-                                                                    sessionId={sessionId}
-                                                                />
-                                                            </div>
-                                                        )
-                                                    }] : []),
-                                                    {
-                                                        key: "3.5",
-                                                        label: "Pathway Venn Diagram",
-                                                        children: (
-                                                            <div id="meta-pathway-venn" style={{scrollMarginTop: '100px'}}>
-                                                                <Tabs
-                                                                    defaultActiveKey="0"
-                                                                    type={"card"}
-                                                                    onChange={(activeKey) => {
-                                                                    }}
-                                                                    items={
-                                                                        Object.keys(dbsObj)
-                                                                            .filter(key => resultGroupedDbAll[key] && resultGroupedDbAll[key].length > 0)
-                                                                            .map((key) => {
-                                                                                return {
-                                                                                    label: dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : ""),
-                                                                                    key: key,
-                                                                                    children: (
-                                                                                        <InViewVennDiagramPathwayChart
-                                                                                            configs={configs}
-                                                                                            analyses={analysesObj}
-                                                                                            analysisResultsByDb={resultGroupedDbAll[key] || []}
-                                                                                            dbId={key}
-                                                                                            dbName={dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : "")}
-                                                                                            metaData={pathwayMetaResults}
-                                                                                            metaAnalyses={metaAnalyses}
-                                                                                        />
-                                                                                    )
-                                                                                }
-                                                                            })
-                                                                    }
-                                                                />
-                                                            </div>
-                                                        )
-                                                    },
-                                                    {
-                                                        key: "4",
-                                                        label: "Multi Analysis KEGG Map",
-                                                        children: (
-                                                            <div id="meta-kegg" style={{scrollMarginTop: '100px'}}>
-                                                                <InViewKEGGMapMultiAnalysis
-                                                                    configs={configs}
-                                                                    analyses={analysesObj}
-                                                                    metaData={DEMetaResults}
-                                                                    sessionId={sessionId}
-                                                                />
-                                                            </div>
-                                                        )
-                                                    },
-                                                    {
-                                                        key: "5",
-                                                        label: "Pathway Heatmap",
-                                                        children: (
-                                                            <div id="meta-pathway-heatmap" style={{scrollMarginTop: '100px'}}>
-                                                                <Tabs
-                                                                    defaultActiveKey="0"
-                                                                    type={"card"}
-                                                                    onChange={(activeKey) => {
-                                                                    }}
-                                                                    items={
-                                                                    (() => {
-                                                                        const allDbKeys = Object.keys(dbsObj);
-                                                                        const filtered = allDbKeys.filter(key => resultGroupedDbAll[key] && resultGroupedDbAll[key].length > 0);
-                                                                        console.log("[DEBUG Pathway Heatmap] All db keys:", allDbKeys, "Filtered db keys:", filtered);
-                                                                        return filtered;
-                                                                    })()
-                                                                        .map((key) => {
-                                                                        return {
-                                                                            label: dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : ""),
-                                                                            key: key,
-                                                                            children: (
-                                                                                <InViewHeatMapChartTable
-                                                                                    analyses={analysesObj}
-                                                                                    configs={configs}
-                                                                                    dbId={key}
-                                                                                    metaData={pathwayMetaResults}
-                                                                                    metaAnalyses={metaAnalyses}
-                                                                                    sessionId={sessionId}
-                                                                                    analysisResultsByDb={resultGroupedDbAll[key] || []}
-                                                                                    setAnalyses={setAnalyses}
-                                                                                >
-                                                                                </InViewHeatMapChartTable>
-                                                                            )
-                                                                        }
-                                                                    })
-                                                                }
-                                                            />
-                                                            </div>
-                                                        )
-                                                    },
-                                                    {
-                                                        key: "6",
-                                                        label: "Funnel Plot",
-                                                        children: (() => {
-                                                            // A funnel plot needs a standard error, which only REML produces.
-                                                            // Show a tab only for databases that actually have plottable funnel
-                                                            // data; if none do, show the explanatory hint once instead of
-                                                            // empty tabs (see funnelPlotMeta.js).
-                                                            const funnelDbKeys = Object.keys(dbsObj)
-                                                                .filter(key => resultGroupedDbAll[key] && resultGroupedDbAll[key].length > 0)
-                                                                .filter(key => hasFunnelData((pathwayMetaResults || []).filter(m => m && m.databaseId === key)))
-                                                            return (
-                                                                <div id="meta-funnel" style={{scrollMarginTop: '100px'}}>
-                                                                    {funnelDbKeys.length === 0 ? (
-                                                                        <div style={{padding: '20px', textAlign: 'center'}}>
-                                                                            <Empty description={funnelEmptyStateMessage(pathwayMetaResults || [])} />
-                                                                        </div>
-                                                                    ) : (
-                                                                        <Tabs
-                                                                            defaultActiveKey="0"
-                                                                            type={"card"}
-                                                                            onChange={(activeKey) => {
-                                                                            }}
-                                                                            items={
-                                                                            funnelDbKeys.map((key) => {
-                                                                                return {
-                                                                                    label: dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : ""),
-                                                                                    key: key,
-                                                                                    children: (
-                                                                                        <InViewFunnelPlotChartTable
-                                                                                            analyses={analysesObj}
-                                                                                            configs={configs}
-                                                                                            dbId={key}
-                                                                                            metaData={pathwayMetaResults}
-                                                                                            metaAnalyses={metaAnalyses}
-                                                                                            sessionId={sessionId}
-                                                                                            analysisResultsByDb={resultGroupedDbAll[key] || []}
-                                                                                        ></InViewFunnelPlotChartTable>
-                                                                                    )
-                                                                                }
-                                                                            })
-                                                                        }
-                                                                        />
-                                                                    )}
-                                                                </div>
-                                                            )
-                                                        })()
-                                                    },
-                                                    {
-                                                        key: "7",
-                                                        label: "Multi Analysis Forest Plot",
-                                                        children: (
-                                                            <div id="meta-forest" style={{scrollMarginTop: '100px'}}>
-                                                                <Tabs
-                                                                    defaultActiveKey="0"
-                                                                    type={"card"}
-                                                                    onChange={(activeKey) => {
-                                                                    }}
-                                                                    items={
-                                                                    Object.keys(dbsObj)
-                                                                        .filter(key => resultGroupedDbAll[key] && resultGroupedDbAll[key].length > 0)
-                                                                        .map((key) => {
-                                                                        return {
-                                                                            label: dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : ""),
-                                                                            key: key,
-                                                                            children: (
-                                                                                <InViewMultiForestChart
-                                                                                    analyses={analysesObj}
-                                                                                    configs={configs}
-                                                                                    dbId={key}
-                                                                                    metaData={pathwayMetaResults}
-                                                                                    metaAnalyses={metaAnalyses}
-                                                                                    sessionId={sessionId}
-                                                                                    analysisResultsByDb={resultGroupedDbAll[key] || []}
-                                                                                ></InViewMultiForestChart>
-                                                                            )
-                                                                        }
-                                                                    })
-                                                                }
-                                                            />
-                                                            </div>
-                                                        )
-                                                    },
-                                                    {
-                                                        key: "8",
-                                                        label: "Multi Analysis Pathway Network",
-                                                        children: (
-                                                            <div id="meta-pathway-network" style={{scrollMarginTop: '100px'}}>
-                                                                <Tabs
-                                                                    defaultActiveKey="0"
-                                                                    type={"card"}
-                                                                    onChange={(activeKey) => {
-                                                                    }}
-                                                                    items={
-                                                                    Object.keys(dbsObj)
-                                                                        .filter(key => resultGroupedDbAll[key] && resultGroupedDbAll[key].length > 0)
-                                                                        .map((key) => {
-                                                                        return {
-                                                                            label: dbsObj[key].name + (dbsObj[key].namespace !== undefined ? ` (${dbsObj[key].namespace.split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")})` : ""),
-                                                                            key: key,
-                                                                            children: (
-                                                                                <InViewMultiAnalysisPathwayGraphComponentTable
-                                                                                    analyses={analysesObj}
-                                                                                    configs={configs}
-                                                                                    dbId={key}
-                                                                                    metaData={pathwayMetaResults}
-                                                                                    metaAnalyses={metaAnalyses}
-                                                                                    sessionId={sessionId}
-                                                                                    analysisResultsByDb={resultGroupedDbAll[key] || []}
-                                                                                />
-                                                                            )
-                                                                        }
-                                                                    })
-                                                                }
-                                                            />
-                                                            </div>
-                                                        )
-                                                    },
-                                                ]
-                                            }
-                                        />
-                                    )
-                                } : null,
-                            {
-                                label: "AI-Powered",
-                                key: "ai-powered",
-                                disabled: analyses.length === 0,
-                                icon: !(dataLoaded) ? <LoadingOutlined/> : null,
-                                children: (
-                                    <Space direction="vertical" size="middle" style={{width: '100%'}}>
-                                        <Space size="middle" wrap>
-                                            <Button
-                                                type="primary"
-                                                icon={<BulbOutlined/>}
-                                                onClick={() => {
-                                                    // The generation wizard lives on the
-                                                    // AI-interpretation page, so carry the study
-                                                    // across and let the user pick which analysis
-                                                    // to interpret there. urlPrefix matters: the
-                                                    // route is registered as `${urlPrefix}/ai-interpretation`.
-                                                    navigate(`${urlPrefix}/ai-interpretation?sessionId=${sessionId}`);
-                                                }}
-                                            >
-                                                Generate Insight
-                                            </Button>
-                                            <Typography.Text type="secondary">
-                                                Opens the AI Interpretation page to configure and run a new report.
-                                            </Typography.Text>
-                                        </Space>
-                                        <Collapse
-                                            bordered={false}
-                                            defaultActiveKey={["1"]}
-                                            key={"ai-powered"}
-                                            items={
-                                                [
-                                                    {
-                                                        key: "1",
-                                                        label: "Generated Reports",
-                                                        children: (
-                                                            <InsightDashboard
-                                                                userId={Meteor.userId()}
-                                                                sessionId={sessionId}
-                                                                onViewInsight={(batchId) => {
-                                                                    // Navigate to AI-interpretation page to view the report
-                                                                    window.location.href = `${urlPrefix}/ai-interpretation`;
-                                                                }}
-                                                            />
-                                                        )
-                                                    }
-                                                ]
-                                            }
-                                        />
-                                    </Space>
-                                )
-                            },
-                            {
-                                label: "Dataset Metadata",
-                                key: "dataset-metadata",
-                                disabled: Object.keys(analysesMetadata).length === 0,
-                                children: (
-                                    <MetadataTable
-                                        analysesMetadata={analysesMetadata}
-                                        sessionId={sessionId}
-                                    />
-                                )
-                            }
-                        ].filter(item => item !== null)}
+                        items={allTabItems}
                     />
+                    {/* The pinned panes. antd is no longer mounting them, so its one useful pane
+                        behaviour has to be reproduced: a pane stays mounted once opened and is
+                        merely hidden, exactly as TabPanelList does. Unmounting instead would reset
+                        MetaAnalysisBuilder's state every time the user looked at another tab.
+                        Rendering only what has been opened also makes these LAZIER than before,
+                        when all three pane trees were built inline on every render of this page. */}
+                    {pinnedTabItems
+                        .filter(item => mountedPinnedKeys.includes(item.key))
+                        .map(item => (
+                            <div
+                                key={item.key}
+                                style={{display: activeTabKey === item.key ? 'block' : 'none'}}
+                            >
+                                {item.children}
+                            </div>
+                        ))}
                 </Space>
                     </Layout.Content>
                 </Layout>
@@ -1960,6 +2171,12 @@ const COLORS = [
     "#FFEB3B", "#673AB7", "#00BCD4", "#8BC34A", "#FF5722"
 ];
 
+// Case-insensitive symbol search for the Circos highlight picker. Deliberately NOT the
+// dual label-or-value matcher from VolcanoGenePicker: there the label is a symbol and the
+// value an Entrez id, so it must try both. Here both are the symbol, so one test is enough.
+const circosGeneFilterOption = (input, option) =>
+    String(option.value).toLowerCase().includes(String(input).toLowerCase());
+
 const CircosChartTable = ({
                               analysisId,
                               inputType,
@@ -1971,6 +2188,7 @@ const CircosChartTable = ({
                               config,
                               handleChangingDESettings,
                               circosDisplayPathways,
+                              circosDisplayGenes,
                               maxAdjustedPValue,
                               minLogFoldChange,
                               pathwayPValueFDRThres,
@@ -1981,8 +2199,13 @@ const CircosChartTable = ({
                               // deGenes
                           }) => {
     // const [selectedPathways, setSelectedPathways] = useState([]);
-    const [inputGenesPathways, setInputGenesPathways] = useState([]);
-    const [inputRelation, setInputRelation] = useState([]);
+    // Raw pathway docs from geneSet.getInfo. The rendered chart is a pure, synchronous
+    // derivation of these (below) — deliberately NOT rebuilt by the fetch effect, so
+    // changing the gene target or the highlight set never re-issues a Meteor call.
+    const [pathwayInfo, setPathwayInfo] = useState([]);
+    // Ephemeral, view-only (nothing persists), mirroring the gene volcano. Values are gene
+    // SYMBOLS: after the id->symbol mapping the symbol is the graph's only join key.
+    const [highlightedGenes, setHighlightedGenes] = useState([]);
     let [result, setResult] = useState([]);
     let [DEGenes, setDEGenes] = useState([]);
     const [isLoadingData, setIsLoadingData] = useState(true);
@@ -2008,7 +2231,7 @@ const CircosChartTable = ({
             // New method => its pathways/chart are not computed yet; force the
             // "loading" state until effect D recomputes them (avoids a stale flash).
             setPathwaysResolved(false);
-            setInputGenesPathways([]);
+            setPathwayInfo([]);
             let args = {
                 resultId: analysisId,
                 databaseId: geneSet.id,
@@ -2124,6 +2347,11 @@ const CircosChartTable = ({
 
     useEffect(() => {
         if (selectedPathwaysState.length === 0) return;
+        // Guards against out-of-order completions: pathwayInfo is the sole input to the chart,
+        // so a slow earlier fetch resolving after a faster later one would render a stale
+        // pathway set, and its `finally` would un-gate the spinner while the current fetch is
+        // still in flight.
+        let cancelled = false;
         const fetchData = async () => {
             try {
                 // const pathwayData = await Meteor.callAsync('pathway.extractAnalysisData',
@@ -2163,57 +2391,71 @@ const CircosChartTable = ({
                     organismId
                 });
 
-                // Create a Map for faster lookups
-                const DEGenesMap = new Map(DEGenes.map(gene => [gene._id, gene]));
-
-                const updatedPathways = await Promise.all(data.map(async pathway => {
-                    const filteredGenesWithSymbols = pathway.genes
-                        .filter(geneId => DEGenesMap.has(geneId))
-                        .map(geneId => {
-                            const geneInfo = DEGenesMap.get(geneId);
-                            return geneInfo.symbol
-                        });
-                    return {
-                        ...pathway,
-                        genes: filteredGenesWithSymbols
-                    };
-                }));
-
-                const inputPathwaysArr = updatedPathways.map((pathway, index) => ({
-                    id: index,
-                    name: pathway.name,
-                    color: COLORS[index % COLORS.length],
-                    type: "pathway",
-                    path_id: pathway.id
-                }));
-
-                const allGenes = new Set(updatedPathways.flatMap(pathway => pathway.genes));
-                const allGenesWithFC = DEGenes.filter(e => allGenes.has(e.symbol));
-
-                const inputGenesArr = allGenesWithFC.map((gene, index) => ({
-                    id: index + inputPathwaysArr.length,
-                    name: gene.symbol,
-                    logFC: gene.FC,
-                    type: "gene",
-                    gene_id: gene._id
-                }));
-
-                const pathwayGeneRelation = updatedPathways.flatMap(pathway =>
-                    pathway.genes.map(gene => ({
-                        from: inputPathwaysArr.find(e => e.path_id === pathway.id).id,
-                        to: inputGenesArr.find(e => e.name === gene).id
-                    }))
-                );
-                setIsLoadingData(false);
-                setInputGenesPathways([...inputPathwaysArr, ...inputGenesArr]);
-                setInputRelation(pathwayGeneRelation);
+                if (cancelled) return;
+                setPathwayInfo(Array.isArray(data) ? data : []);
             } catch (error) {
+                // Deliberately does NOT clear pathwayInfo: it is now the sole input to the
+                // chart, so blanking it on a transient failure would replace an already
+                // rendered plot with an empty one. Keeping the last good pathway set matches
+                // the previous behaviour, where a throw simply left the old nodes in place.
                 console.error("Error fetching data:", error);
+            } finally {
+                // In a finally so a throw cannot leave the pane spinning: this used to sit
+                // inside the try, after the node/relation build, so any throw from that build
+                // left isLoadingData true forever.
+                if (!cancelled) setIsLoadingData(false);
             }
         };
 
         fetchData();
-    }, [selectedPathways, DEGenes, method, selectedPathwaysState]);
+        return () => { cancelled = true; };
+        // `DEGenes` is deliberately NOT a dependency: geneSet.getInfo returns pathway gene
+        // MEMBERSHIP, which does not depend on the DE thresholds, and the id->symbol join
+        // that did need DEGenes now lives in the pure memo below. Listing it here re-issued
+        // the Meteor call on every nudge of the DE pValue.FDR / Log2FC inputs, for every
+        // mounted pane.
+    }, [selectedPathways, method, selectedPathwaysState]);
+
+    // Displayed pathways with their gene ids resolved to the symbols of the DE genes they
+    // contain. Shared by the graph build and the picker options so the mapping runs once.
+    const symbolPathways = useMemo(
+        () => mapPathwayGenesToSymbols(pathwayInfo, DEGenes),
+        [pathwayInfo, DEGenes]
+    );
+
+    // The chart data, derived purely and synchronously. Node ids are positional and are used
+    // as raw matrix indices by circos-d3, so they are assigned only after the gene selection
+    // is final, and relations are pruned to surviving genes rather than resolved with a
+    // `.find(...).id` that threw the moment a gene was dropped.
+    const circosGraph = useMemo(() => buildCircosGraph(
+        symbolPathways,
+        DEGenes,
+        {
+            topN: circosDisplayGenes,
+            highlightedSymbols: highlightedGenes,
+            colors: COLORS,
+        }
+        // `highlightedGenes` is a useState array, so its identity is stable between renders
+        // and only changes when the user edits the selection — exactly when a rebuild is
+        // wanted. No content hashing needed.
+    ), [symbolPathways, DEGenes, circosDisplayGenes, highlightedGenes]);
+
+    const inputGenesPathways = circosGraph.nodes;
+    const inputRelation = circosGraph.relations;
+
+    // Options for the highlight picker: every gene of THIS pane's displayed pathways, taken
+    // BEFORE the target is applied, so a gene can be highlighted precisely because the target
+    // cut it. A previously-picked symbol that has since left the set stays selected — antd
+    // renders the tag from its value, which is the symbol itself — and the caption reports it.
+    const geneOptions = useMemo(() => {
+        const symbolsInView = new Set();
+        for (const pathway of symbolPathways) {
+            for (const symbol of pathway.genes) symbolsInView.add(symbol);
+        }
+        return [...symbolsInView].sort().map(symbol => ({label: symbol, value: symbol}));
+    }, [symbolPathways]);
+
+    const geneSelectionCaption = describeGeneSelection(circosGraph.stats);
 
     // Single source of truth for what to render. The loading flags gate every
     // "no data" verdict so the genuine empty-states never flash while data loads.
@@ -2248,12 +2490,47 @@ const CircosChartTable = ({
                 <div>{PLOT_STATE_MESSAGES[displayState]}</div>
             )}
             {displayState === 'ready' && (
-                <Space direction={'vertical'}>
-                    <CircosD3Chart
-                        pathwayGenes={inputGenesPathways}
-                        flows={inputRelation}
-                        chartId={key}
-                    />
+                <Space direction={'vertical'} style={{width: '100%'}}>
+                    {/* Hidden when there is nothing to connect: geneOptions is necessarily
+                        empty in that case, so the picker would be an empty control sitting
+                        above a message explaining there are no genes. */}
+                    {inputRelation.length > 0 && (
+                    <Space wrap align="center">
+                        <HighlightOutlined/>
+                        <Typography.Text>Highlight genes:</Typography.Text>
+                        <Select
+                            mode="multiple"
+                            showSearch
+                            allowClear
+                            maxTagCount="responsive"
+                            placeholder="Search a gene symbol…"
+                            style={{minWidth: 240, maxWidth: 460}}
+                            value={highlightedGenes}
+                            onChange={(values) => setHighlightedGenes(values || [])}
+                            options={geneOptions}
+                            filterOption={circosGeneFilterOption}
+                            listHeight={288}
+                        />
+                    </Space>
+                    )}
+                    {geneSelectionCaption && (
+                        <Typography.Text type="secondary">{geneSelectionCaption}</Typography.Text>
+                    )}
+                    {inputRelation.length === 0 ? (
+                        // circos-d3 returns early on empty flows, drawing nothing at all. Say so
+                        // rather than showing a blank canvas.
+                        <Typography.Text type="secondary">
+                            None of the displayed pathways contain a differentially expressed gene,
+                            so there is nothing to connect. Try relaxing the DE gene filters or
+                            displaying more pathways.
+                        </Typography.Text>
+                    ) : (
+                        <CircosD3Chart
+                            pathwayGenes={inputGenesPathways}
+                            flows={inputRelation}
+                            chartId={key}
+                        />
+                    )}
                 </Space>
             )}
         </>
@@ -2269,6 +2546,7 @@ const CircosTabs = ({
                         setCurrentMethod,
                         handleChangingDESettings,
                         circosDisplayPathways,
+                        circosDisplayGenes,
                         pathwayPValueFDRThres
                     }) => {
     const [selectedPathways, setSelectedPathways] = useState(new Map());
@@ -2323,6 +2601,7 @@ const CircosTabs = ({
                                                         config={config}
                                                         handleChangingDESettings={handleChangingDESettings}
                                                         circosDisplayPathways={circosDisplayPathways}
+                                                        circosDisplayGenes={circosDisplayGenes}
                                                         maxAdjustedPValue={config.maxAdjustedPValue}
                                                         minLogFoldChange={config.minLogFoldChange}
                                                         pathwayPValueFDRThres={pathwayPValueFDRThres}
@@ -2362,6 +2641,20 @@ const CircosTabs = ({
     )
 }
 
+// /api/resultData for the two panes below, whose ranking effects use `result.length === 0` as
+// their "no data yet" guard.
+//
+// "Nothing" is normalised to an empty ARRAY, not {}, and that is load-bearing rather than a
+// stylistic choice: {} has no `.length`, so `result.length === 0` would be false and
+// NegBarChartTable would fall through to `Object.keys(result)[0]` === undefined,
+// setAnalysisMethod(undefined), and then `result[undefined].sort(...)` — an uncaught TypeError in
+// an effect, with no error boundary anywhere in the client to contain it. Keeping the existing
+// empty-array sentinel preserves both panes' behaviour exactly while removing the throw.
+const methodResultsOrEmpty = (resJson, databaseId, analysisId) => {
+    const methods = extractMethodResults(resJson, databaseId, analysisId);
+    return methods && Object.keys(methods).length > 0 ? methods : [];
+};
+
 const ForestChartTable = ({
                               analysisId,
                               inputType,
@@ -2380,11 +2673,21 @@ const ForestChartTable = ({
     // genuinely empty result (which previously got stuck on "Loading" forever).
     const [loadingResult, setLoadingResult] = useState(true);
     const [loadingTree, setLoadingTree] = useState(true);
+    // "We never got the data" and "there is genuinely nothing" rendered the same message before,
+    // so a dropped request was indistinguishable from an empty result.
+    const [resultFailed, setResultFailed] = useState(false);
+    const [treeFailed, setTreeFailed] = useState(false);
     const [sortingOptions, setSortingOptions] = useState([])
 
     useEffect(() => {
+        // Guards against out-of-order completions, as the Circos fetch does: this effect re-runs on
+        // analysisId, and a superseded response must neither overwrite the newer result nor clear
+        // the loading flag from its `finally` while the current request is still in flight — which
+        // would un-gate the empty-state message mid-fetch.
+        let cancelled = false;
         async function fetchData() {
             setLoadingResult(true);
+            setResultFailed(false);
             let args = {
                 analysisId
             };
@@ -2394,15 +2697,22 @@ const ForestChartTable = ({
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
                 let resJson = await response.json();
-                setResult(resJson[geneSet.id][analysisId]);
+                // Was `resJson[geneSet.id][analysisId]`. When this analysis had no rows for this
+                // database that indexed undefined and threw INTO the catch below, which logged and
+                // moved on, leaving `result` empty — so the pane reported "no significant pathways"
+                // for a study that may well have had them.
+                if (cancelled) return;
+                setResult(methodResultsOrEmpty(resJson, geneSet.id, analysisId));
             } catch (error) {
                 console.error("Error fetching data:", error);
+                if (!cancelled) setResultFailed(true);
             } finally {
-                setLoadingResult(false);
+                if (!cancelled) setLoadingResult(false);
             }
         }
 
         fetchData();
+        return () => { cancelled = true; };
     }, [analysisId]);
 
     useEffect(() => {
@@ -2429,7 +2739,12 @@ const ForestChartTable = ({
     }, [result, analysisMethod]);
 
     useEffect(() => {
+        // Same out-of-order guard as the result fetch above; this effect re-runs on analysisId too.
+        // Note it does NOT re-raise setLoadingTree(true) — that would be a behavioural change on an
+        // analysis switch and belongs with the dep-array cleanup this commit deliberately leaves.
+        let cancelled = false;
         async function fetchData() {
+            setTreeFailed(false);
             let args = {
                 analysisId,
                 sessionId
@@ -2440,8 +2755,17 @@ const ForestChartTable = ({
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
                 let resultTree = await response.json();
-                let treeData = resultTree.treeData[geneSet.id].filter(e => e.key === analysisId)
-                let initialTreeData = resultTree.initialTreeData[geneSet.id].filter(e => e.split("_")[0] === analysisId)
+                // Same unguarded two-level index as the result fetch above, and the same false
+                // negative when this database is absent from the payload: the throw was caught and
+                // the pane reported "no significant pathways".
+                const treeForDb = resultTree?.treeData?.[geneSet.id];
+                const initialForDb = resultTree?.initialTreeData?.[geneSet.id];
+                let treeData = Array.isArray(treeForDb)
+                    ? treeForDb.filter(e => e.key === analysisId)
+                    : []
+                let initialTreeData = Array.isArray(initialForDb)
+                    ? initialForDb.filter(e => e.split("_")[0] === analysisId)
+                    : []
 
                 // Remove consensus here as it has no scores
                 // treeData = treeData.map(data => {
@@ -2452,18 +2776,21 @@ const ForestChartTable = ({
                 // })
                 // initialTreeData = initialTreeData.filter(node => !node.includes('consensus'))
 
+                if (cancelled) return;
                 setTreeData(treeData);
                 setInitialTreeData(initialTreeData);
                 setValue(initialTreeData);
 
             } catch (error) {
                 console.error("Error fetching data:", error);
+                if (!cancelled) setTreeFailed(true);
             } finally {
-                setLoadingTree(false);
+                if (!cancelled) setLoadingTree(false);
             }
         }
 
         fetchData();
+        return () => { cancelled = true; };
     }, [analysisId]);
 
     useEffect(() => {
@@ -2507,12 +2834,23 @@ const ForestChartTable = ({
     // }
 
     // Loading only while the fetches are in flight. Once both have settled, a
-    // genuinely empty result shows a no-data message instead of looping forever.
-    if (loadingResult || loadingTree) {
+    // genuinely empty result shows a no-data message instead of looping forever —
+    // and a fetch that FAILED now says so rather than borrowing the empty-result copy.
+    //
+    // `hasData` keeps this pane's own predicate. It is stricter than NegBarChartTable's, which
+    // omits the initialTreeData clause; that divergence predates this change (the commented-out
+    // guards above both panes show it) and treeData/initialTreeData are filtered from two
+    // different arrays by two different predicates, so they can genuinely disagree. Not unified.
+    const displayState = computeFetchedPlotState({
+        loading: loadingResult || loadingTree,
+        failed: resultFailed || treeFailed,
+        hasData: Object.keys(result).length > 0 && treeData.length > 0 && initialTreeData.length > 0,
+    });
+    if (displayState === 'loading') {
         return <PlotLoading/>;
     }
-    if (Object.keys(result).length === 0 || treeData.length === 0 || initialTreeData.length === 0) {
-        return "No significant pathways were identified";
+    if (displayState !== 'ready') {
+        return <div>{PLOT_STATE_MESSAGES[displayState]}</div>;
     }
 
     return (
@@ -2580,11 +2918,20 @@ const NegBarChartTable = ({
     // genuinely empty result (which previously got stuck on "Loading" forever).
     const [loadingResult, setLoadingResult] = useState(true);
     const [loadingTree, setLoadingTree] = useState(true);
+    // "We never got the data" and "there is genuinely nothing" rendered the same message before,
+    // so a dropped request was indistinguishable from an empty result.
+    const [resultFailed, setResultFailed] = useState(false);
+    const [treeFailed, setTreeFailed] = useState(false);
     const [sortingOptions, setSortingOptions] = useState([])
 
     useEffect(() => {
+        // Cancellation guard, as on the Circos fetch. This effect does not currently re-run (see
+        // the dep-array note below), but the flag still stops a resolution after unmount writing
+        // state, and keeps the idiom identical across all four fetches in these two panes.
+        let cancelled = false;
         async function fetchData() {
             setLoadingTree(true);
+            setTreeFailed(false);
             let args = {
                 analysisId,
                 sessionId
@@ -2595,8 +2942,17 @@ const NegBarChartTable = ({
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
                 let resultTree = await response.json();
-                let treeData = resultTree.treeData[geneSet.id].filter(e => e.key === analysisId)
-                let initialTreeData = resultTree.initialTreeData[geneSet.id].filter(e => e.split("_")[0] === analysisId)
+                // Same unguarded two-level index as the result fetch below, and the same false
+                // negative when this database is absent from the payload: the throw was caught and
+                // the pane reported "no significant pathways".
+                const treeForDb = resultTree?.treeData?.[geneSet.id];
+                const initialForDb = resultTree?.initialTreeData?.[geneSet.id];
+                let treeData = Array.isArray(treeForDb)
+                    ? treeForDb.filter(e => e.key === analysisId)
+                    : []
+                let initialTreeData = Array.isArray(initialForDb)
+                    ? initialForDb.filter(e => e.split("_")[0] === analysisId)
+                    : []
 
                 // Remove consensus here as it has no scores
                 // treeData = treeData.map(data => {
@@ -2607,22 +2963,35 @@ const NegBarChartTable = ({
                 // })
                 // initialTreeData = initialTreeData.filter(node => !node.includes('consensus'))
 
+                if (cancelled) return;
                 setTreeData(treeData);
                 setInitialTreeData(initialTreeData);
                 setValue(initialTreeData);
             } catch (error) {
                 console.error("Error fetching data:", error);
+                if (!cancelled) setTreeFailed(true);
             } finally {
-                setLoadingTree(false);
+                if (!cancelled) setLoadingTree(false);
             }
         }
 
         fetchData();
+        return () => { cancelled = true; };
+        // NOTE the empty dep array, unlike ForestChartTable's `[analysisId]` on the same fetch:
+        // this pane keeps the tree of whatever analysis it first mounted with. That divergence is
+        // pre-existing and is left alone here — changing it alters what the pane shows after an
+        // analysis switch, which is a behavioural change and not this commit's subject.
     }, []);
 
     useEffect(() => {
+        // Guards against out-of-order completions, as the Circos fetch does: this effect re-runs on
+        // analysisId, and a superseded response must neither overwrite the newer result nor clear
+        // the loading flag from its `finally` while the current request is still in flight — which
+        // would un-gate the empty-state message mid-fetch.
+        let cancelled = false;
         async function fetchData() {
             setLoadingResult(true);
+            setResultFailed(false);
             let args = {
                 analysisId
             };
@@ -2632,15 +3001,22 @@ const NegBarChartTable = ({
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
                 let resJson = await response.json();
-                setResult(resJson[geneSet.id][analysisId]);
+                // Was `resJson[geneSet.id][analysisId]`. When this analysis had no rows for this
+                // database that indexed undefined and threw INTO the catch below, which logged and
+                // moved on, leaving `result` empty — so the pane reported "no significant pathways"
+                // for a study that may well have had them.
+                if (cancelled) return;
+                setResult(methodResultsOrEmpty(resJson, geneSet.id, analysisId));
             } catch (error) {
                 console.error("Error fetching data:", error);
+                if (!cancelled) setResultFailed(true);
             } finally {
-                setLoadingResult(false);
+                if (!cancelled) setLoadingResult(false);
             }
         }
 
         fetchData();
+        return () => { cancelled = true; };
     }, [analysisId]);
 
     useEffect(() => {
@@ -2704,12 +3080,22 @@ const NegBarChartTable = ({
     // }
 
     // Loading only while the fetches are in flight. Once both have settled, a
-    // genuinely empty result shows a no-data message instead of looping forever.
-    if (loadingResult || loadingTree) {
+    // genuinely empty result shows a no-data message instead of looping forever —
+    // and a fetch that FAILED now says so rather than borrowing the empty-result copy.
+    //
+    // `hasData` keeps this pane's own predicate: unlike ForestChartTable it does NOT require
+    // initialTreeData. That divergence predates this change (see the commented-out guards above
+    // both panes) and is left alone rather than unified.
+    const displayState = computeFetchedPlotState({
+        loading: loadingResult || loadingTree,
+        failed: resultFailed || treeFailed,
+        hasData: Object.keys(result).length > 0 && treeData.length > 0,
+    });
+    if (displayState === 'loading') {
         return <PlotLoading/>;
     }
-    if (Object.keys(result).length === 0 || treeData.length === 0) {
-        return "No significant pathways were identified";
+    if (displayState !== 'ready') {
+        return <div>{PLOT_STATE_MESSAGES[displayState]}</div>;
     }
 
     return (
@@ -2775,12 +3161,19 @@ const KEGGMap = ({
     let [mode, setMode] = useState("fc");
     const [isChecked, setIsChecked] = useState(false);
     const [pValueThreshold, setPValueThreshold] = useState(0.05);
-    const [results, setResults] = useState([]);
+    // null, not [], so "not fetched yet" is representable. As an empty ARRAY this passed the
+    // consensus fallback's `typeof results === 'object'` guard while `Object.keys([])` came back
+    // empty, so the very first effect run concluded "no pathways" from data that had not arrived.
+    const [results, setResults] = useState(null);
     // Distinguish "still fetching consensus pathways" from "genuinely none found".
     const [loadingConsensus, setLoadingConsensus] = useState(true);
     // The consensus fallback reads `results`; keep the loader up until that fetch
     // resolves too, so we never flash "no pathways" before results are in.
     const [loadingResults, setLoadingResults] = useState(true);
+    // "We never got the data" is a different fact from "there is genuinely nothing", and rendering
+    // the second for the first is what let this bug hide. Both fetches report their own failure.
+    const [resultsFailed, setResultsFailed] = useState(false);
+    const [consensusFailed, setConsensusFailed] = useState(false);
     const [fcPValueData, setFcPValueData] = useState([])
     const [actualMethod, setActualMethod] = useState('consensus');
     const [threshold, setThreshold] = useState({
@@ -2819,7 +3212,13 @@ const KEGGMap = ({
     }, [config]);
 
     useEffect(() => {
+        // Same out-of-order guard as the Circos fetch above: this effect re-runs on analysisId, and
+        // a slow earlier response must neither overwrite newer results nor clear the loading flag
+        // from its `finally` while the current request is still in flight.
+        let cancelled = false;
         async function fetchData() {
+            setLoadingResults(true);
+            setResultsFailed(false);
             let args = {
                 analysisId
             };
@@ -2829,16 +3228,27 @@ const KEGGMap = ({
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
                 let resJson = await response.json();
-                setResults(resJson[geneSet.id][analysisId]);
+                if (cancelled) return;
+                // Was `resJson[geneSet.id][analysisId]`, which THREW into the catch below whenever
+                // this analysis had no rows for this database — leaving `results` at its initial
+                // value and the pane claiming there were no significant pathways. A null here is a
+                // successful "nothing for this database", NOT a failure, so it does not set
+                // resultsFailed: the consensus branch may still have pathways to show.
+                setResults(extractMethodResults(resJson, geneSet.id, analysisId));
             } catch (error) {
                 console.error("Error fetching data:", error);
+                if (!cancelled) {
+                    setResults(null);
+                    setResultsFailed(true);
+                }
             } finally {
-                setLoadingResults(false);
+                if (!cancelled) setLoadingResults(false);
             }
         }
 
         fetchData();
-    }, [analysisId]);
+        return () => { cancelled = true; };
+    }, [analysisId, geneSet.id]);
 
     useEffect(() => {
         async function fetchData() {
@@ -2862,7 +3272,20 @@ const KEGGMap = ({
     }, []);
 
     useEffect(() => {
+        // THE ORDERING FIX. This effect re-runs when `results` arrives, so it issues the SAME
+        // Meteor call twice per mount: once with no fallback data, once with it. That method calls
+        // this.unblock() (server/api/methods/visualization.js), which drops DDP's per-connection
+        // ordering guarantee, so the two invocations run concurrently on the server and can return
+        // out of order — and the first one, computed with no results, would then overwrite the
+        // second one's good selection. React runs this cleanup before the next run's body, so the
+        // superseded call can no longer write state or clear the loading flag.
+        let cancelled = false;
         async function fetchConsensusData() {
+          // Re-raise the loader for THIS run. Without it the first run's `finally` leaves the pane
+          // un-gated while the second is still in flight, which is a visible flash of the empty
+          // state rather than a wrong final answer.
+          setLoadingConsensus(true);
+          setConsensusFailed(false);
           try {
             const consensusResults = await Meteor.callAsync('visualization.getConsensusAnalysisResult', {
                 // enrichmentMethods: initialMethods,
@@ -2870,46 +3293,31 @@ const KEGGMap = ({
                 databaseId: geneSet.id
             });
 
-            let pathwayResults = [];
-            let methodUsed = 'consensus';
+            if (cancelled) return;
 
-            // Try to use consensus results first
-            if (consensusResults && consensusResults.length > 0 && consensusResults[0]?.value?.length > 0) {
-                pathwayResults = consensusResults[0].value;
-                methodUsed = 'consensus';
-            }
-            // Fall back to individual method results if no consensus exists
-            else if (results && typeof results === 'object') {
-                // Try to get results from available enrichment methods (fgsea, ora, gsea, etc.)
-                const methodKeys = Object.keys(results);
-                for (const methodKey of methodKeys) {
-                    if (results[methodKey] && Array.isArray(results[methodKey]) && results[methodKey].length > 0) {
-                        pathwayResults = results[methodKey];
-                        methodUsed = methodKey;
-                        console.log(`Using ${methodKey} results as fallback`);
-                        break;
-                    }
-                }
-            }
-
-            // Set the actual method being used for table sorting
+            // Consensus first, else the first non-empty per-method result. Extracted so the
+            // "[undefined] is a length-1 array no length check catches" trap is unrepresentable
+            // and unit-testable; see imports/utils/pathwaySelection.js.
+            const {pathwayIds, methodUsed} = selectConsensusPathwayIds(consensusResults, results);
             setActualMethod(methodUsed);
-
-            // sort by pValue ascending
-            const sortedResults = pathwayResults.sort((a, b) => a.pValue - b.pValue);
-            // take the first 300
-            const selectedPathways = sortedResults.slice(0, 300).map(e => e.pathway);
-            let topSelectedPathway = selectedPathways[0]
-            setPathwayId([topSelectedPathway])
+            // ONE pathway, matching the previous behaviour exactly. The old code ranked the top 300
+            // and then kept only `selectedPathways[0]`; this pane is a single-pathway view
+            // (selectType='radio', and KeggChart resolves its map with
+            // `String(pathwayId).match(/\d+/)`), so handing it the whole ranked list would break it.
+            // The full ranking is still computed so the preselected pathway is the table's own top
+            // row rather than whatever happened to arrive first.
+            setPathwayId(pathwayIds.slice(0, 1));
           } catch (error) {
               console.error("Error fetching consensus data:", error);
+              if (!cancelled) setConsensusFailed(true);
           } finally {
-              setLoadingConsensus(false);
+              if (!cancelled) setLoadingConsensus(false);
           }
         }
 
         fetchConsensusData();
-    }, [results]);
+        return () => { cancelled = true; };
+    }, [analysisId, geneSet.id, results]);
 
     const onModeChange = ({target: {value}}) => {
         setMode(value);
@@ -2924,11 +3332,19 @@ const KEGGMap = ({
     };
 
 
-    if (loadingConsensus || loadingResults) {
+    // `pathwayId.includes(undefined)` used to sit here. It was a patch for the producer storing
+    // [undefined]; selectConsensusPathwayIds now makes that unrepresentable, so the test is gone
+    // rather than kept "just in case" — leaving it would hide a regression instead of failing on it.
+    const displayState = computeFetchedPlotState({
+        loading: loadingConsensus || loadingResults,
+        failed: consensusFailed || resultsFailed,
+        hasData: pathwayId.length > 0,
+    });
+    if (displayState === 'loading') {
         return <PlotLoading/>;
     }
-    if (pathwayId.includes(undefined) || pathwayId.length === 0) {
-        return "No significant pathways found"
+    if (displayState !== 'ready') {
+        return <div>{PLOT_STATE_MESSAGES[displayState]}</div>;
     }
 
     const debounceChangeThreshold = _.debounce((value) => {
@@ -3679,13 +4095,33 @@ const VennDiagramChart = ({configs, analyses, metaAnalysis, sessionId}) => {
 }
 const InViewVennDiagramChart = inViewRender(VennDiagramChart);
 
-const VennDiagramPathwayChart = ({configs, analyses, analysisResultsByDb, dbId, dbName, metaData, metaAnalyses, fdrThreshold = 0.05, scoreThreshold = 1.5}) => {
+// The fdrThreshold = 0.05 / scoreThreshold = 1.5 prop defaults are gone: no caller ever passed them,
+// so the filter silently ran at those constants while the controls drawn by VennDiagramPathway
+// changed nothing. The thresholds are now state here, set by those controls.
+// const VennDiagramPathwayChart = ({configs, analyses, analysisResultsByDb, dbId, dbName, metaData, metaAnalyses, fdrThreshold = 0.05, scoreThreshold = 1.5}) => {
+const VennDiagramPathwayChart = ({configs, analyses, analysisResultsByDb, dbId, dbName, metaData, metaAnalyses}) => {
     const [vennData, setVennData] = useState([])
     const [treeData, setTreeData] = useState([]);
     const [value, setValue] = useState([]);
     // True once we've actually computed against ready inputs — lets us tell
     // "still loading" apart from "computed, no significant pathways".
     const [computed, setComputed] = useState(false);
+    // Whether there is any pathway row at all before filtering, so "this database has no results"
+    // can be told apart from "the thresholds exclude everything".
+    const [hasAnyPathways, setHasAnyPathways] = useState(false);
+
+    // Filter state lives here, not in VennDiagramPathway, because both the analysis picker below and
+    // the diagram are built from the filtered sets: keeping one source means the picker can never
+    // list an analysis the diagram doesn't draw.
+    const { globalSettings } = useGlobalSettings();
+    const [enableSignificantFilter, setEnableSignificantFilter] = useState(true);
+    const [fdrThreshold, setFdrThreshold] = useState(globalSettings.pValueFDR);
+    const [scoreThreshold, setScoreThreshold] = useState(globalSettings.enrichmentScore);
+
+    useEffect(() => {
+        setFdrThreshold(globalSettings.pValueFDR);
+        setScoreThreshold(globalSettings.enrichmentScore);
+    }, [globalSettings]);
 
     useEffect(() => {
         if (!analysisResultsByDb || !configs || Object.keys(configs).length === 0) {
@@ -3697,6 +4133,7 @@ const VennDiagramPathwayChart = ({configs, analyses, analysisResultsByDb, dbId, 
             setVennData([]);
             setTreeData([]);
             setValue([]);
+            setHasAnyPathways(false);
             setComputed(true);
             return;
         }
@@ -3721,8 +4158,11 @@ const VennDiagramPathwayChart = ({configs, analyses, analysisResultsByDb, dbId, 
         // Filter pathways by significance criteria and create venn data
         let vennDataRes = Object.keys(groupedByAnalysis).map(analysisId => {
             const pathways = groupedByAnalysis[analysisId];
+            // Was `p.pValueFDR < fdrThreshold && Math.abs(p.score) > scoreThreshold`. IPSA reads
+            // "FDR <= x and |Score| >= y" everywhere, and the checkbox can now turn the filter off.
             const significantPathways = pathways
-                .filter(p => p.pValueFDR < fdrThreshold && Math.abs(p.score) > scoreThreshold)
+                .filter(p => !enableSignificantFilter
+                    || passesSignificance(p, {fdr: fdrThreshold, score: scoreThreshold}))
                 .map(p => p.pathway);
 
             return {
@@ -3744,14 +4184,17 @@ const VennDiagramPathwayChart = ({configs, analyses, analysisResultsByDb, dbId, 
         setValue(initialTreeData)
         setVennData(vennDataRes)
         setTreeData(treeDataRes)
+        setHasAnyPathways(Object.values(groupedByAnalysis).some(list => list.length > 0))
         setComputed(true)
-    }, [configs, analyses, analysisResultsByDb, dbId, metaData, metaAnalyses, fdrThreshold, scoreThreshold]);
+    }, [configs, analyses, analysisResultsByDb, dbId, metaData, metaAnalyses, enableSignificantFilter, fdrThreshold, scoreThreshold]);
 
     if (!computed) {
         return <PlotLoading/>
     }
-    if (vennData.length === 0) {
-        return <div>No significant pathways found.</div>
+    // Only when there is nothing to filter. When the thresholds exclude everything,
+    // VennDiagramPathway still renders its controls (with a message) so the user can loosen them.
+    if (!hasAnyPathways) {
+        return <div>No pathway results for this database.</div>
     }
 
     const onChange = (newValue) => {
@@ -3781,11 +4224,21 @@ const VennDiagramPathwayChart = ({configs, analyses, analysisResultsByDb, dbId, 
                 configs={Object.values(configs)}
                 dbId={dbId}
                 dbName={dbName}
+                enableSignificantFilter={enableSignificantFilter}
+                setEnableSignificantFilter={setEnableSignificantFilter}
+                fdrThreshold={fdrThreshold}
+                setFdrThreshold={setFdrThreshold}
+                scoreThreshold={scoreThreshold}
+                setScoreThreshold={setScoreThreshold}
             />
         </>
     )
 }
 const InViewVennDiagramPathwayChart = inViewRender(VennDiagramPathwayChart);
+
+// metaDE rows come in two shapes: meta.analysis.DE.compute writes enriched rows with `pValueFDR`,
+// older results hold the raw R rows with only `pFDR`. Read the FDR from whichever is present.
+const metaGeneFdr = (row) => Number.isFinite(row?.pValueFDR) ? row.pValueFDR : row?.pFDR;
 
 const HeatmapGeneChart = ({configs, analyses, metaData, sessionId}) => {
     const { globalSettings } = useGlobalSettings();
@@ -3828,11 +4281,13 @@ const HeatmapGeneChart = ({configs, analyses, metaData, sessionId}) => {
                     let filteredMetaData = metaData.map(e => {
                         return {
                             ...e,
-                            value: e.value.filter(e => e[pValueType] < pValueThreshold).map(e => {
+                            // Was `e[pValueType]` in the filter and `e.pFDR` in the map: each half only
+                            // worked for one row shape (see metaGeneFdr).
+                            value: e.value.filter(e => metaGeneFdr(e) <= pValueThreshold).map(e => {
                                 return {
                                     id: e.ID.toString(),
                                     FC: e.logFC,
-                                    pValueFDR: e.pFDR,
+                                    pValueFDR: metaGeneFdr(e),
                                     pValue: e.pValue
                                 }
                             })
@@ -3864,9 +4319,9 @@ const HeatmapGeneChart = ({configs, analyses, metaData, sessionId}) => {
                                 console.log('First gene structure:', study.fcPValueData[0])
                             }
                             const significantGenes = study.fcPValueData.filter(gene =>
-                                gene && gene.pValueFDR < pValueThreshold
+                                gene && gene.pValueFDR <= pValueThreshold
                             )
-                            console.log(`Study ${idx}: ${significantGenes.length} significant genes (pValueFDR < ${pValueThreshold})`)
+                            console.log(`Study ${idx}: ${significantGenes.length} significant genes (pValueFDR <= ${pValueThreshold})`)
                             significantGenes.forEach(gene => individualGenesSet.add(gene.id))
                         }
                     })
@@ -3906,7 +4361,7 @@ const HeatmapGeneChart = ({configs, analyses, metaData, sessionId}) => {
                         geneSignificanceCount[geneId] = 0
                         analysesData.forEach(study => {
                             const gene = study.values.find(g => g.id === geneId)
-                            if (gene && gene.pValueFDR < pValueThreshold) {
+                            if (gene && gene.pValueFDR <= pValueThreshold) {
                                 geneSignificanceCount[geneId]++
                             }
                         })
@@ -3923,12 +4378,13 @@ const HeatmapGeneChart = ({configs, analyses, metaData, sessionId}) => {
                 let filteredMetaData = metaData.map(e => {
                     return {
                         ...e,
-                        value: e.value.filter(e => e[pValueType] < pValueThreshold).map(e => {
+                        // Same two-shape read as the gene-list block above (see metaGeneFdr).
+                        value: e.value.filter(e => metaGeneFdr(e) <= pValueThreshold).map(e => {
                             return {
                                 id: e.ID.toString(),
                                 FC: e.logFC,
                                 logFCSE: e.logFCSE,
-                                pValueFDR: e.pFDR,
+                                pValueFDR: metaGeneFdr(e),
                                 pValue: e.pValue
                             }
                         })
@@ -3996,7 +4452,7 @@ const HeatmapGeneChart = ({configs, analyses, metaData, sessionId}) => {
                 let vennData = expressionData.map(e => {
                     return {
                         label: analysisDisplayName(analyses, e.analysisId, e.name),
-                        values: e.fcPValueData.filter(gene => gene[pValueType] < pValueThreshold).map(e => e.id)
+                        values: e.fcPValueData.filter(gene => gene[pValueType] <= pValueThreshold).map(e => e.id)
                     }
                 })
                 // Filter genes that appear in at least minDatasetsThreshold datasets
@@ -4085,7 +4541,7 @@ const HeatmapGeneChart = ({configs, analyses, metaData, sessionId}) => {
                 <Empty
                     description={
                         <span>
-                            No genes found significant (FDR &lt; {pValueThreshold}) in at least {minDatasetsThreshold} dataset(s) out of {numDatasets}.<br/>
+                            No genes found significant (FDR &le; {pValueThreshold}) in at least {minDatasetsThreshold} dataset(s) out of {numDatasets}.<br/>
                             Try lowering the minimum datasets threshold or check that your analyses have overlapping significant genes.
                         </span>
                     }
@@ -4150,7 +4606,7 @@ const HeatmapGeneChart = ({configs, analyses, metaData, sessionId}) => {
                         />
                     </Space>
                     <span style={{color: '#888'}}>
-                        ({sortedGenes.length} genes with FDR &lt; {pValueThreshold})
+                        ({sortedGenes.length} genes with FDR &le; {pValueThreshold})
                     </span>
                 </Space>
             </div>

@@ -1,21 +1,35 @@
 import React, { useState, useEffect } from 'react';
 import { Modal, Form, Input, Button, Radio, Select, Space, Typography, Divider } from 'antd';
-import { PlusOutlined, FolderOpenOutlined } from '@ant-design/icons';
+import { PlusOutlined, FolderOpenOutlined, ExperimentOutlined, DatabaseOutlined } from '@ant-design/icons';
 import { Meteor } from 'meteor/meteor';
+// Random.id() is called below and was never imported — there is no global. Every "add to existing
+// study" submission threw ReferenceError. The homepage now opens this modal, so the path matters.
+import { Random } from 'meteor/random';
 import { useTracker } from 'meteor/react-meteor-data';
 import { useNavigate } from 'react-router-dom';
 
 const { Text, Title } = Typography;
 
+// 'createAnalysis' and 'massAnalysis' each commit to one kind up front — that is what the header's
+// two menu entries mean. 'choose' asks instead, for an entry point that is not already an answer:
+// the homepage's "Start Your Analysis" knows the user wants to analyse something, not which of the
+// two they want.
 export default function StudySelectionModal({
     visible,
     onClose,
-    mode = 'createAnalysis' // 'createAnalysis' or 'massAnalysis'
+    mode = 'createAnalysis' // 'createAnalysis', 'massAnalysis' or 'choose'
 }) {
     const navigate = useNavigate();
     const [form] = Form.useForm();
     const [loading, setLoading] = useState(false);
     const [studyOption, setStudyOption] = useState('new'); // 'new' or 'existing'
+    // Only consulted in 'choose'; the other two modes are their own answer.
+    const [analysisKind, setAnalysisKind] = useState('createAnalysis');
+    const effectiveMode = mode === 'choose' ? analysisKind : mode;
+    // A mass analysis always starts a new study — its "add to existing" picker is not rendered. This
+    // keeps a stale 'existing', chosen before the user switched kind, from both hiding the study-name
+    // field and adding a single analysis to some unrelated study.
+    const effectiveStudyOption = effectiveMode === 'massAnalysis' ? 'new' : studyOption;
 
     const user = useTracker(() => Meteor.user());
 
@@ -40,7 +54,8 @@ export default function StudySelectionModal({
     useEffect(() => {
         if (visible) {
             form.resetFields();
-            setStudyOption(mode === 'massAnalysis' ? 'new' : 'new');
+            setStudyOption('new');
+            setAnalysisKind('createAnalysis');
         }
     }, [visible, form, mode]);
 
@@ -49,7 +64,7 @@ export default function StudySelectionModal({
         try {
             let sessionId, activeAnalysis;
 
-            if (studyOption === 'new') {
+            if (effectiveStudyOption === 'new') {
                 // Create new study
                 const result = await Meteor.callAsync('session.create', {
                     userId: user?._id,
@@ -72,14 +87,14 @@ export default function StudySelectionModal({
             }
 
             // Navigate based on mode
-            if (mode === 'massAnalysis') {
+            if (effectiveMode === 'massAnalysis') {
                 navigate(`${urlPrefix}/analysis/mass-analysis/${sessionId}`);
             } else {
                 navigate(`${urlPrefix}/analysis/session/${sessionId}/${activeAnalysis}`);
             }
 
             onClose();
-            notify.success(studyOption === 'new' ? 'Study created successfully!' : 'Analysis created in existing study!');
+            notify.success(effectiveStudyOption === 'new' ? 'Study created successfully!' : 'Analysis created in existing study!');
         } catch (error) {
             notify.error(error.reason || 'Failed to create. Please try again.');
         } finally {
@@ -88,6 +103,9 @@ export default function StudySelectionModal({
     };
 
     const getTitle = () => {
+        if (mode === 'choose') {
+            return 'Start Your Analysis';
+        }
         if (mode === 'massAnalysis') {
             return 'Create Mass Analysis';
         }
@@ -95,6 +113,9 @@ export default function StudySelectionModal({
     };
 
     const getDescription = () => {
+        if (mode === 'choose') {
+            return 'Analyse one dataset, or several at once.';
+        }
         if (mode === 'massAnalysis') {
             return 'Create a new study to run mass analysis on multiple datasets.';
         }
@@ -118,7 +139,38 @@ export default function StudySelectionModal({
                 layout="vertical"
                 onFinish={handleSubmit}
             >
-                {mode === 'createAnalysis' && (
+                {mode === 'choose' && (
+                    <Form.Item>
+                        <Radio.Group
+                            value={analysisKind}
+                            onChange={(e) => setAnalysisKind(e.target.value)}
+                            style={{ width: '100%' }}
+                        >
+                            <Space direction="vertical" style={{ width: '100%' }}>
+                                <Radio value="createAnalysis">
+                                    <Space>
+                                        <ExperimentOutlined />
+                                        Single analysis
+                                        <Text type="secondary" style={{ fontSize: 12 }}>
+                                            (one dataset)
+                                        </Text>
+                                    </Space>
+                                </Radio>
+                                <Radio value="massAnalysis">
+                                    <Space>
+                                        <DatabaseOutlined />
+                                        Mass analysis
+                                        <Text type="secondary" style={{ fontSize: 12 }}>
+                                            (many datasets at once)
+                                        </Text>
+                                    </Space>
+                                </Radio>
+                            </Space>
+                        </Radio.Group>
+                    </Form.Item>
+                )}
+
+                {effectiveMode === 'createAnalysis' && (
                     <Form.Item>
                         <Radio.Group
                             value={studyOption}
@@ -148,7 +200,7 @@ export default function StudySelectionModal({
                     </Form.Item>
                 )}
 
-                {studyOption === 'new' && (
+                {effectiveStudyOption === 'new' && (
                     <Form.Item
                         label="Study Name"
                         name="studyName"
@@ -158,7 +210,7 @@ export default function StudySelectionModal({
                     </Form.Item>
                 )}
 
-                {studyOption === 'existing' && mode === 'createAnalysis' && (
+                {effectiveStudyOption === 'existing' && effectiveMode === 'createAnalysis' && (
                     <Form.Item
                         label="Select Study"
                         name="existingStudy"
@@ -184,7 +236,7 @@ export default function StudySelectionModal({
                             Cancel
                         </Button>
                         <Button type="primary" htmlType="submit" loading={loading}>
-                            {mode === 'massAnalysis' ? 'Create & Start Mass Analysis' : 'Create'}
+                            {effectiveMode === 'massAnalysis' ? 'Create & Start Mass Analysis' : 'Create'}
                         </Button>
                     </Space>
                 </Form.Item>

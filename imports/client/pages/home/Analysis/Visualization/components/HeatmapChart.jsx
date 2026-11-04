@@ -1709,7 +1709,7 @@ export default ({analysisResultsByDb, selectedAnalysisMethods, analysisNames, co
             let hasSignificant = false;
             pathways.forEach(p => {
                 const isSig = threshold === 0
-                    || (significanceMetric === 'pvalue' ? p.pValue < threshold : p.pValueFDR < threshold);
+                    || (significanceMetric === 'pvalue' ? p.pValue <= threshold : p.pValueFDR <= threshold);
                 if (isSig) { hasSignificant = true; significantPathwaysSet.add(p.pathway); }
             });
             if (!hasSignificant) analysesWithoutSignificantPathways.push(analysisKey);
@@ -1790,9 +1790,9 @@ export default ({analysisResultsByDb, selectedAnalysisMethods, analysisNames, co
                     if (threshold === 0) {
                         isSignificant = true;
                     } else if (significanceMetric === 'pvalue') {
-                        isSignificant = data.pValue < threshold;
+                        isSignificant = data.pValue <= threshold;
                     } else { // 'fdr'
-                        isSignificant = data.pValueFDR < threshold;
+                        isSignificant = data.pValueFDR <= threshold;
                     }
 
                     plotData.push([
@@ -2114,11 +2114,13 @@ export default ({analysisResultsByDb, selectedAnalysisMethods, analysisNames, co
                                     <Option value="pvalue">p-value</Option>
                                     <Option value="fdr">FDR</Option>
                                 </Select>
-                                <Text>&lt;</Text>
+                                <Text>&le;</Text>
                                 <Select
                                     value={threshold}
                                     onChange={setThreshold}
-                                    style={{width: 90}}
+                                    // 110, not 90: the dropdown is sized to the Select, and its custom
+                                    // input (80px + 16px padding) overflowed a 90px popup.
+                                    style={{width: 110}}
                                     size="small"
                                     dropdownRender={(menu) => (
                                         <>

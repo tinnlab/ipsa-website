@@ -291,8 +291,13 @@ export const deleteExpiredStudies = async ({
     const running = runningAnalysisIds ?? (await fetchRunningAnalysisIds(AnalysisLog));
     // Push the expiry predicate into Mongo to bound the scan (don't load every Session each night).
     // selectExpiredSessions re-validates in JS (belt-and-suspenders + malformed-date safety).
+    //
+    // `permanent` studies (the seeded case studies — server/helper/caseStudies.js) are excluded
+    // outright. The seeder also clears their expiredAt, so today they cannot match `$lt` anyway;
+    // naming the flag here states permanence where the deletion happens, rather than leaving it to
+    // rest on the ABSENCE of a field that any future write could restore.
     const sessions = await Sessions.find(
-        { expiredAt: { $lt: new Date(nowMs) } },
+        { expiredAt: { $lt: new Date(nowMs) }, permanent: { $ne: true } },
         { fields: { _id: 1, userId: 1, analyses: 1, metaAnalyses: 1, expiredAt: 1 } }
     ).fetchAsync();
 
@@ -393,6 +398,12 @@ export const extendStudy = async ({
     if (session.userId !== requesterUserId) {
         throw new Meteor.Error('not-authorized', 'You can only extend your own studies.');
     }
+    // A permanent study has nothing to extend, and extending one would BREAK it: extendedExpiry
+    // falls back to `now` when there is no current expiry, so this would stamp a real expiredAt on
+    // a study that is meant to outlive the sweep. The Extend button is deliberately never disabled
+    // in the UI (a user must always be able to rescue a study), so the case study's owner is one
+    // click away from quietly un-permanenting it. Not an error — there is simply nothing to do.
+    if (session.permanent === true) return null;
     const newExpiredAt = extendFn(session.expiredAt);
     await collections.Session.updateAsync({ _id: sessionId }, { $set: { expiredAt: newExpiredAt } });
     return newExpiredAt;
@@ -411,7 +422,15 @@ export const backfillLegacyExpiry = async ({
 } = {}) => {
     if (!Sessions) return { updated: 0 };
     const days = sessionExpiryDays();
-    const sessions = await Sessions.find({}, { fields: { createdAt: 1, expiredAt: 1 } }).fetchAsync();
+    // `permanent` studies are excluded, and this exclusion is load-bearing rather than cosmetic.
+    // backfilledExpiry treats a missing expiredAt as a legacy short expiry (`cur` is NaN, so the
+    // "already at/beyond a full window" test cannot fire) and returns a fresh date. Since this runs
+    // on EVERY boot over EVERY session, a seeded case study whose expiredAt the seeder had cleared
+    // would be re-stamped at each restart and eventually swept — silently undoing permanence.
+    const sessions = await Sessions.find(
+        { permanent: { $ne: true } },
+        { fields: { createdAt: 1, expiredAt: 1 } }
+    ).fetchAsync();
     let updated = 0;
     for (const s of sessions) {
         const target = backfilledExpiry(s.createdAt, s.expiredAt, days, nowMs);

@@ -77,7 +77,7 @@ export default function HomeLayout(props) {
         { link: '/mass-analysis', title: 'Create Mass Analysis', action: 'massAnalysis' }
       ]
     },
-    { link: '/ai-interpretation', title: "AI-interpretation" },
+    { link: '/ai-interpretation', title: "Biological Interpretation" },
     { link: '/tutorial/index.html', title: "Tutorial" },
     { link: '/contact', title: "Contact" },
     ...adminMenu

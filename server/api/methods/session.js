@@ -3,6 +3,7 @@ import { Random } from 'meteor/random';
 import { check } from 'meteor/check';
 import { createHash } from 'crypto';
 import { assertWritableSession } from '../../helper/ownership';
+import { recentStudiesSelector } from '/imports/utils/recentStudies';
 
 // Simple rate limiter using in-memory storage
 const rateLimitStore = new Map();
@@ -33,6 +34,26 @@ function hashPassword(password) {
 }
 
 Meteor.methods({
+    /**
+     * How many studies the caller has, for the homepage's "My Recent Studies" button.
+     *
+     * A method rather than a subscription. session.all publishes whole Session documents with only
+     * two fields projected away, so every study's analyses[] array travels with it — including the
+     * per-dataset metadata blobs a mass analysis writes, kilobytes each. Shipping all of that to
+     * render one integer is not a trade worth making.
+     *
+     * Counts through recentStudiesSelector, the same selector the Recent Studies page filters by, so
+     * the number on the button and the rows behind it cannot drift apart.
+     *
+     * Returns 0 rather than throwing for a caller who is not logged in: the button hides itself at
+     * zero, which is the right outcome, and a toast about authorization on the homepage is not.
+     */
+    async 'session.myStudyCount'() {
+        const selector = recentStudiesSelector(this.userId);
+        if (!selector) return 0;
+        return DBCollections.Session.find(selector).countAsync();
+    },
+
     /**
      * Save workspace - save all current sessions with workspace name, email, and password
      */

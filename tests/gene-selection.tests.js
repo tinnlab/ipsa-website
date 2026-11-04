@@ -29,7 +29,7 @@ const ids = (rows) => rows.map((r) => r.id);
 
 describe("geneSelection", function () {
     describe("filterGenes", function () {
-        it("keeps only genes with FDR < fdr AND |foldChange| > fc", function () {
+        it("keeps only genes with FDR <= fdr AND |foldChange| >= fc", function () {
             // fdr 0.05, fc 0.5: a out (FDR .20), b in, c in, d out (|FC| 0.6 ok but FDR .04<.05 -> in? |FC| .6>.5 in), e in
             const out = filterGenes(makeFixture(), { fdr: 0.05, fc: 0.5 });
             // a: FDR .20 -> out. b: FDR .01,|FC|2.5 -> in. c: FDR .01,|FC|1.2 -> in.
@@ -38,13 +38,17 @@ describe("geneSelection", function () {
             assert.deepStrictEqual(ids(out), ["b", "c", "d", "e"]);
         });
 
-        it("uses strict inequalities at the boundary", function () {
+        it("is inclusive at the boundary", function () {
+            // FDR <= x and |Log2FC| >= y, matching selectAnalysisDEGenes and the volcano export.
             const rows = [
-                { id: "eqFdr", pValueFDR: 0.05, foldChange: 9 }, // FDR == threshold -> excluded
-                { id: "eqFc", pValueFDR: 0.0, foldChange: 1.0 }, // |FC| == threshold -> excluded
+                { id: "eqFdr", pValueFDR: 0.05, foldChange: 9 }, // FDR == threshold -> kept
+                { id: "eqFc", pValueFDR: 0.0, foldChange: 1.0 }, // |FC| == threshold -> kept
+                { id: "eqFcNeg", pValueFDR: 0.0, foldChange: -1.0 }, // |FC| == threshold -> kept
                 { id: "in", pValueFDR: 0.049, foldChange: 1.01 },
+                { id: "overFdr", pValueFDR: 0.0501, foldChange: 9 }, // just above -> excluded
+                { id: "underFc", pValueFDR: 0.0, foldChange: 0.999 }, // just below -> excluded
             ];
-            assert.deepStrictEqual(ids(filterGenes(rows, { fdr: 0.05, fc: 1.0 })), ["in"]);
+            assert.deepStrictEqual(ids(filterGenes(rows, { fdr: 0.05, fc: 1.0 })), ["eqFdr", "eqFc", "eqFcNeg", "in"]);
         });
 
         it("treats a missing FDR as 1 (not significant)", function () {
@@ -70,7 +74,7 @@ describe("geneSelection", function () {
 
         it("returns only genes passing the thresholds", function () {
             const top = selectTopGenes(makeFixture(), { fdr: 0.05, fc: 0.5, topN: 10 });
-            assert.ok(top.every((g) => (g.pValueFDR ?? 1) < 0.05 && Math.abs(g.foldChange) > 0.5));
+            assert.ok(top.every((g) => (g.pValueFDR ?? 1) <= 0.05 && Math.abs(g.foldChange) >= 0.5));
             assert.ok(!ids(top).includes("a")); // a fails FDR
         });
 
@@ -126,11 +130,11 @@ describe("geneSelection", function () {
             assert.deepStrictEqual(ids(de), ["b", "c", "e", "d"]);
         });
 
-        it("uses INCLUSIVE boundaries (>= / <=), unlike the strict 'select top' filter", function () {
+        it("uses INCLUSIVE boundaries (>= / <=), the same as the 'select top' filter", function () {
             const rows = [{ id: "edge", pValueFDR: 0.05, foldChange: 0.5 }];
             assert.deepStrictEqual(ids(selectAnalysisDEGenes(rows, { maxAdjustedPValue: 0.05, minLogFoldChange: 0.5 })), ["edge"]);
-            // the strict tunable filter would drop it:
-            assert.deepStrictEqual(filterGenes(rows, { fdr: 0.05, fc: 0.5 }), []);
+            // the tunable filter used to be strict and drop it; both now keep a gene on the boundary:
+            assert.deepStrictEqual(ids(filterGenes(rows, { fdr: 0.05, fc: 0.5 })), ["edge"]);
         });
 
         it("falls back to 0.05 / 0.5 when thresholds are missing or non-numeric", function () {

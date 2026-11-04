@@ -13,12 +13,24 @@ import _ from 'lodash';
 import axios from 'axios';
 import { countDeGenes } from '../../../../../../../utils/deAnalysisUtils';
 import { getVolcanoOptions } from '../../../../../../../utils/volcanoPlotOptions';
-import { derivePgseaPersistPayload, parsePgseaGeneStats, RANKING_OPTIONS } from '/imports/utils/pgseaInput';
+import {
+    derivePgseaPersistPayload,
+    parsePgseaGeneStats,
+    RANKING_OPTIONS,
+    PGSEA_STATS_FORMAT,
+    PGSEA_FC_COLUMN_HELP,
+    PGSEA_FC_SCALE_OPTIONS,
+    normalizePgseaFcScale
+} from '/imports/utils/pgseaInput';
+import useInputTypePolicy from '/imports/client/hooks/useInputTypePolicy';
 import { sortOrganismsByName } from '/imports/utils/organismSort';
+import { shouldAutoloadExample } from '/imports/utils/exampleAutoload';
 
 const { Title, Text } = Typography;
 
-const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) => {
+// shouldLoadExample / onExampleConsumed come from AnalysisWizard and drive the homepage demo boxes:
+// see the effect at the very bottom of this component, whose position in the file is load-bearing.
+const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated, shouldLoadExample = false, onExampleConsumed }) => {
     const [selectedOrg, setSelectedOrg] = useState(null);
     const [isValidating, setIsValidating] = useState(false);
     const [validationResult, setValidationResult] = useState({ input: null, background: null, expression: null, group: null });
@@ -38,12 +50,13 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
     const isBusy = isUploading || awaitingSampleGroups;
 
     useSubscription("organism.user.all", {}, []);
+    const { pgseaRequireStatsColumns } = useInputTypePolicy();
 
     const { isLoading, data } = useMethod("analysis.getData", {
         analysisId,
         inputType,
         keys: inputType === 'ora' ? ['input', 'background', 'taxId'] :
-              inputType === 'pgsea' ? ['input', 'inputRaw', 'rankingBy', 'taxId'] :
+              inputType === 'pgsea' ? ['input', 'inputRaw', 'rankingBy', 'fcScale', 'taxId'] :
               ['expressionFile', 'groupFile', 'taxId']
     }, [analysisId, inputType]);
 
@@ -74,12 +87,20 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
                 inputType,
                 key: 'rankingBy'
             }) : null;
+            // The declared scale of the fold-change column; absent (every analysis saved before
+            // it existed) means log2.
+            const fcScaleConfig = inputType === 'pgsea' ? DBCollections.AnalysisConfig.findOne({
+                analysisId,
+                inputType,
+                key: 'fcScale'
+            }) : null;
 
             return {
                 input: inputConfig?.value || '',
                 background: backgroundConfig?.value || '',
                 inputRaw: rawConfig?.value,
-                rankingBy: rankingConfig?.value
+                rankingBy: rankingConfig?.value,
+                fcScale: fcScaleConfig?.value
             };
         }
         return { input: '', background: '' };
@@ -172,24 +193,41 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
     // original text and is what we seed from and re-derive `input` from.
     // ---------------------------------------------------------------------------------
     const [pgseaText, setPgseaText] = useState('');
-    const [pgseaMeta, setPgseaMeta] = useState({ available: [], error: null });
+    // `rejected`: the text broke the 3-column requirement and was NOT saved. `warnings`: the
+    // normalizer's non-blocking observations (e.g. no negative fold changes).
+    const [pgseaMeta, setPgseaMeta] = useState({ available: [], error: null, rejected: false, warnings: [] });
     const [pgseaSeeded, setPgseaSeeded] = useState(false);
     // Optimistic mirror of the stored `rankingBy`. `analysis.update` does not echo rankingBy
     // back, so Minimongo only catches up once the subscription delivers it; without this the
     // radio would visibly snap back to the old option for a round-trip after each click.
     const [pgseaRanking, setPgseaRanking] = useState(null);
+    // Same optimistic mirror for the declared fold-change scale.
+    const [pgseaFcScale, setPgseaFcScale] = useState(null);
     // What we last dispatched to the server, so change detection does not depend on Minimongo
     // catching up. Null until the first write of this mount.
     const lastSentPgseaRef = useRef(null);
 
     // Parse + collapse + persist. Shared by upload, textarea, example and the ranking radio
     // so they can never disagree about how the input is interpreted.
-    const persistPgseaInput = async (rawText, { requestedRankingBy, taxId } = {}) => {
+    const persistPgseaInput = async (rawText, { requestedRankingBy, requestedFcScale, taxId } = {}) => {
+        // The 3-column requirement applies to NEW text only. Re-saving what is already stored
+        // (the ranking radio, a blur without edits, the reopen repair) must keep working for a
+        // single-metric analysis saved before the requirement. The server applies the same rule.
+        const storedText = inputData.inputRaw ?? inputData.input;
+        const isNewText = String(rawText ?? '').trim() !== String(storedText ?? '').trim();
+        const requireStats = pgseaRequireStatsColumns && isNewText;
+        const storedFcScale = normalizePgseaFcScale(inputData.fcScale);
         const payload = derivePgseaPersistPayload(rawText, {
             storedRankingBy: pgseaRanking ?? inputData.rankingBy,
-            requestedRankingBy
+            requestedRankingBy,
+            requireStats,
+            fcScale: requestedFcScale ?? pgseaFcScale ?? storedFcScale
         });
-        setPgseaMeta({ available: payload.available, error: payload.error });
+        // A value <= 0 under a declared linear scale is never saved, policy or not.
+        const rejected = Boolean((requireStats && payload.error && !payload.isEmpty) || payload.scaleRejected);
+        setPgseaMeta({ available: payload.available, error: payload.error, rejected, warnings: payload.warnings });
+        // Not saved: whatever was stored before (if anything) stays the analysis's input.
+        if (rejected) return payload;
 
         // Compare against what we LAST DISPATCHED, not against Minimongo. `analysis.update`
         // only echoes `input` back (and not until after gene-ID detection + updateStatistics),
@@ -201,18 +239,30 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
         const baseline = lastSentPgseaRef.current ?? {
             inputRaw: inputData.inputRaw,
             input: inputData.input,
-            rankingBy: inputData.rankingBy
+            rankingBy: inputData.rankingBy,
+            fcScale: storedFcScale
         };
         if (!taxId
             && baseline.inputRaw === payload.inputRaw
             && baseline.input === payload.input
-            && baseline.rankingBy === payload.rankingBy) {
+            && baseline.rankingBy === payload.rankingBy
+            && baseline.fcScale === payload.fcScale) {
             return payload; // genuinely nothing changed — skip the server recompute
         }
 
-        // `input` and `rankingBy` ALWAYS travel together so they can never diverge.
+        // `input`, `rankingBy` and `fcScale` ALWAYS travel together so they can never diverge:
+        // `input` was built from the upload read at `fcScale`, and the server re-reads
+        // `inputRaw` at the stored `fcScale` for the gene-level statistics.
         const update = { inputRaw: payload.inputRaw, input: payload.input };
         if (payload.rankingBy) update.rankingBy = payload.rankingBy;
+        // Written once the user has chosen, whenever a scale is already stored, or when it differs
+        // from what was last sent (Minimongo may not yet hold a just-written 'linear'); an
+        // analysis that never had one keeps reading as log2 without a new key.
+        if (payload.fcScale !== 'log2'
+            || inputData.fcScale != null
+            || baseline.fcScale !== payload.fcScale) {
+            update.fcScale = payload.fcScale;
+        }
         if (taxId) update.taxId = taxId;
 
         // Never relabel an analysis whose ranking we cannot re-derive. A mass-created analysis
@@ -231,13 +281,15 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
         // Mirror optimistically ONLY what we are actually persisting, so the radio can never
         // show a choice that was deliberately not written.
         if (update.rankingBy) setPgseaRanking(update.rankingBy);
+        setPgseaFcScale(payload.fcScale);
 
         // Record what was actually SENT (rankingBy may have been withheld above), so the
         // no-op check on the next call compares against reality.
         lastSentPgseaRef.current = {
             inputRaw: payload.inputRaw,
             input: payload.input,
-            rankingBy: update.rankingBy ?? inputData.rankingBy
+            rankingBy: update.rankingBy ?? inputData.rankingBy,
+            fcScale: payload.fcScale
         };
         await AnalysisUtils.updateAnalysis({ analysisId, inputType, data: update });
         return payload;
@@ -264,8 +316,9 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
         debouncedPersistPgseaInput.cancel();
         lastSentPgseaRef.current = null;
         setPgseaText('');
-        setPgseaMeta({ available: [], error: null });
+        setPgseaMeta({ available: [], error: null, rejected: false, warnings: [] });
         setPgseaRanking(null);
+        setPgseaFcScale(null);
         setPgseaSeeded(false);
     }, [analysisId, inputType, debouncedPersistPgseaInput]);
 
@@ -278,6 +331,10 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
         if (pgseaRanking && inputData.rankingBy === pgseaRanking) setPgseaRanking(null);
     }, [inputData.rankingBy, pgseaRanking]);
 
+    useEffect(() => {
+        if (pgseaFcScale && normalizePgseaFcScale(inputData.fcScale) === pgseaFcScale) setPgseaFcScale(null);
+    }, [inputData.fcScale, pgseaFcScale]);
+
     // Seed once from what is already stored (inputRaw, or `input` for analyses saved before
     // inputRaw existed) so reopening an analysis shows the user's own text.
     useEffect(() => {
@@ -285,8 +342,12 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
         const stored = inputData.inputRaw ?? inputData.input;
         if (!stored) return;
         setPgseaText(stored);
-        const payload = derivePgseaPersistPayload(stored, { storedRankingBy: inputData.rankingBy });
-        setPgseaMeta({ available: payload.available, error: payload.error });
+        // No requireStats: reopening a stored single-metric analysis must not flag it.
+        const payload = derivePgseaPersistPayload(stored, {
+            storedRankingBy: inputData.rankingBy,
+            fcScale: inputData.fcScale
+        });
+        setPgseaMeta({ available: payload.available, error: payload.error, rejected: false, warnings: payload.warnings });
         setPgseaSeeded(true);
 
         // Repair analyses saved before this change. The old wizard wrote whatever the user
@@ -305,7 +366,7 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
             const repairedUsable = Object.keys(parsePgseaGeneStats(payload.input).geneData).length;
             if (repairedUsable > storedUsable) persistPgseaInput(stored);
         }
-    }, [inputType, pgseaSeeded, inputData.inputRaw, inputData.input, inputData.rankingBy]);
+    }, [inputType, pgseaSeeded, inputData.inputRaw, inputData.input, inputData.rankingBy, inputData.fcScale]);
 
     useEffect(() => {
         if (data?.taxId) {
@@ -542,6 +603,35 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
         }
     };
 
+    // The homepage demo boxes: load this input type's example without the user pressing anything.
+    //
+    // DECLARATION ORDER IS LOAD-BEARING and nothing enforces it at runtime. React runs effects in
+    // declaration order, and the pgsea reset effect above (setPgseaText('') / setPgseaSeeded(false))
+    // and the seed-from-stored-text effect after it both run on mount. handleUseSampleData's pgsea
+    // branch sets pgseaText and pgseaSeeded synchronously, so if this effect were declared ABOVE
+    // them the reset would wipe what it just set and the PGSEA demo would show a blank textarea over
+    // correctly saved server data. Keep this effect below both, and below handleUseSampleData.
+    //
+    // It reuses handleUseSampleData rather than reimplementing the load, so a demo click and the
+    // "Use Sample Data" button beside it cannot drift apart: same busy state, same failure toast,
+    // same inputRaw/rankingBy for PGSEA, and for expression the same two uploads recorded in one
+    // analysis.update.
+    useEffect(() => {
+        // `data` is the one-shot analysis.getData fetch. It is the only view of the stored input
+        // that carries a readiness signal — the minimongo trackers above cannot tell "no input"
+        // from "the subscription has not arrived yet", and acting on that ambiguity is what would
+        // paste the example over a real analysis. (useMethod never returns to isLoading:true when
+        // its deps change, but this component's deps cannot change without a remount, so the
+        // snapshot here is always this analysis's own.)
+        if (!shouldAutoloadExample({ shouldLoadExample, inputType, isLoading, data })) return;
+        // Latch FIRST, before any await. Set it afterwards and a double invocation gets past the
+        // check twice: two fetches, four file.upload calls and two concurrent analysis.update
+        // writes for the expression demo.
+        onExampleConsumed?.();
+        handleUseSampleData();
+        // Deliberately not depending on `data` by identity — it is a fresh object on every change.
+    }, [shouldLoadExample, inputType, isLoading]);
+
     const renderValidationAlert = (result, title) => {
         if (!result) return null;
 
@@ -712,7 +802,9 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
                     // Only re-set when the literal-\t rescue actually rewrote the text, so the
                     // textarea does not flash the un-fixed version for a frame.
                     if (payload.inputRaw !== content) setPgseaText(payload.inputRaw);
-                    await validateFileContent(payload.inputRaw, file.name, 'input');
+                    // A file refused by the 3-column requirement was not saved; the exact
+                    // reason is already on screen, so skip the advisory validator.
+                    if (!payload.error) await validateFileContent(payload.inputRaw, file.name, 'input');
                 } finally {
                     setIsUploading(false);
                 }
@@ -741,23 +833,50 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
                 {pgseaMeta.error && (
                     // Deterministic parse failure from the shared normalizer. Shown alongside
                     // (not instead of) the LLM validator alert: this one is exact about why the
-                    // file could not be read, and the raw text is stored unchanged when it fires.
+                    // file could not be read. Without the 3-column requirement the raw text is
+                    // stored unchanged when it fires; with it, nothing is stored.
                     <Alert
-                        message="Could not read this gene list"
-                        description={pgseaMeta.error}
-                        type="warning"
+                        message={pgseaMeta.rejected
+                            ? 'This gene list was not saved'
+                            : 'Could not read this gene list'}
+                        description={pgseaMeta.rejected
+                            ? `${pgseaMeta.error.replace(/^PGSEA Analysis:\s*/, '')} Any previously saved input is still the one this analysis uses.`
+                            : pgseaMeta.error}
+                        type={pgseaMeta.rejected ? 'error' : 'warning'}
                         showIcon
                         style={{ marginBottom: 16 }}
                     />
                 )}
-                <Alert
-                    message="Format: 2 or 3 columns, tab- or comma-separated, header optional"
-                    description="Column 1: Gene identifier | Column 2: Fold-Change | Column 3 (optional): P-value. A 2-column Gene + ranking metric file is still accepted."
-                    type="info"
-                    showIcon
-                    closable
-                    style={{ marginBottom: 16 }}
-                />
+                {pgseaMeta.warnings?.map((warning) => (
+                    <Alert
+                        key={warning}
+                        message={warning}
+                        type="warning"
+                        showIcon
+                        style={{ marginBottom: 16 }}
+                    />
+                ))}
+                {pgseaRequireStatsColumns ? (
+                    <Alert
+                        message="Format: 3 columns, tab- or comma-separated, header optional"
+                        // description={`${PGSEA_STATS_FORMAT}. Column 1: gene identifier | Column 2: log2 fold change (signed; a column of linear fold changes, all > 0 and centred on 1, will be interpreted incorrectly) | Column 3: p-value.`}
+                        description={`${PGSEA_STATS_FORMAT}. Column 1: gene identifier | ${PGSEA_FC_COLUMN_HELP} | Column 3: p-value.`}
+                        type="info"
+                        showIcon
+                        closable
+                        style={{ marginBottom: 16 }}
+                    />
+                ) : (
+                    <Alert
+                        message="Format: 2 or 3 columns, tab- or comma-separated, header optional"
+                        // description="Column 1: Gene identifier | Column 2: log2 fold change | Column 3 (optional): P-value. A 2-column Gene + ranking metric file is still accepted."
+                        description={`Column 1: Gene identifier | ${PGSEA_FC_COLUMN_HELP} | Column 3 (optional): P-value. A 2-column Gene + ranking metric file is still accepted.`}
+                        type="info"
+                        showIcon
+                        closable
+                        style={{ marginBottom: 16 }}
+                    />
+                )}
                 <Space direction="vertical" style={{ width: '100%' }}>
                     <Space>
                         <Upload
@@ -770,12 +889,15 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
                             }}
                         >
                             <Button icon={<UploadOutlined />} disabled={!selectedOrg}>
-                                Upload Ranked Gene List File
+                                Upload Ranked Gene List File with Statistics
                             </Button>
                         </Upload>
-                        <Button size="small" type="link" onClick={() => handleUseSampleData('2col')}>
-                            Use 2-column example
-                        </Button>
+                        {/* The legacy single-metric example would be refused under the 3-column requirement. */}
+                        {!pgseaRequireStatsColumns && (
+                            <Button size="small" type="link" onClick={() => handleUseSampleData('2col')}>
+                                Use 2-column example
+                            </Button>
+                        )}
                     </Space>
                     {!selectedOrg && (
                         <Text type="secondary" style={{ fontSize: 12 }}>
@@ -784,7 +906,7 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
                     )}
                     <Input.TextArea
                         rows={12}
-                        placeholder={'Gene\tFold-Change\tP-value\nGENE1\t2.5\t0.01\nGENE2\t-1.8\t0.03\n...'}
+                        placeholder={'Gene\tlog2FC\tP-value\nGENE1\t2.5\t0.01\nGENE2\t-1.8\t0.03\n...'}
                         value={pgseaText}
                         onChange={(e) => {
                             setPgseaText(e.target.value);
@@ -825,6 +947,27 @@ const Step2_DataInput = ({ analysisId, inputType, sessionId, onDataValidated }) 
                                 P-value ranking needs a P-value column in your input.
                             </Text>
                         )}
+                    </div>
+                    {/* Always settable (not only when the column is all-positive): a linear file
+                        with one stray negative value must still be declarable as linear. The
+                        prominent prompt is the all-positive warning above. */}
+                    <div>
+                        <Text strong>Fold-change column: </Text>
+                        <Radio.Group
+                            style={{ marginTop: 4 }}
+                            value={pgseaFcScale ?? normalizePgseaFcScale(inputData.fcScale)}
+                            onChange={async (e) => {
+                                debouncedPersistPgseaInput.cancel();
+                                await persistPgseaInput(pgseaText, { requestedFcScale: e.target.value });
+                            }}
+                        >
+                            {PGSEA_FC_SCALE_OPTIONS.map(opt => (
+                                <Radio key={opt.value} value={opt.value}>{opt.label}</Radio>
+                            ))}
+                        </Radio.Group>
+                        <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                            Linear fold changes are converted to log2 before ranking and analysis; your file is stored as uploaded.
+                        </Text>
                     </div>
                     <Button
                         onClick={async () => {

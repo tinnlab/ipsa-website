@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Card, Button, Space, Typography, Alert, Progress, Spin, Divider, Form, Input } from 'antd';
+import { Card, Button, Space, Typography, Alert, Progress, Spin, Divider, Form, Input, Tooltip } from 'antd';
 import {
     PlayCircleOutlined,
     ReloadOutlined,
@@ -23,6 +23,9 @@ import { getVolcanoOptions } from '../../../../../../../utils/volcanoPlotOptions
 import { shouldRunConsensusForConfigDoc } from '/imports/methods/consensusTrigger';
 import VolcanoChartGene from '/imports/client/pages/home/Analysis/Visualization/components/VolcanoChartGene';
 import inViewRender from '/imports/client/components/in-view-render/inViewRender';
+import { buildAIInterpretationLink } from '/imports/utils/aiInterpretationSelection';
+import useInputTypePolicy from '/imports/client/hooks/useInputTypePolicy';
+import { isInputTypeBlocked, INTERPRETATION_BLOCKED_REASON } from '/imports/utils/inputTypePolicy';
 
 const { Title, Text } = Typography;
 const urlPrefix = Meteor.settings.public.urlPrefix || '';
@@ -296,8 +299,13 @@ const Step5_RunAnalysis = ({ analysisId, inputType, sessionId, onReRunAnalysis, 
         window.location.href = `${urlPrefix}/analysis/visualization/${sessionId}${query}`;
     };
 
+    const { interpretationBlockedInputTypes } = useInputTypePolicy();
+    const interpretationBlocked = isInputTypeBlocked(inputType, interpretationBlockedInputTypes);
+
     const handleInterpret = () => {
-        navigate(`${urlPrefix}/ai-interpretation?sessionId=${sessionId}&analysisId=${analysisId}`);
+        // Same URL as before, byte for byte — built rather than spelled out, so this page and the
+        // two other producers of this link share one definition of its format.
+        navigate(`${urlPrefix}/ai-interpretation${buildAIInterpretationLink({ sessionId, analysisId })}`);
     };
 
     const handleRunDEAnalysis = async () => {
@@ -585,13 +593,18 @@ const Step5_RunAnalysis = ({ analysisId, inputType, sessionId, onReRunAnalysis, 
                             Visualize Results
                         </Button>
 
-                        <Button
-                            size="large"
-                            icon={<BulbOutlined />}
-                            onClick={handleInterpret}
-                        >
-                            AI Interpretation
-                        </Button>
+                        {/* Gated on input type here; an analysis with no gene-level results is
+                            caught on the interpretation page and by the server. */}
+                        <Tooltip title={interpretationBlocked ? INTERPRETATION_BLOCKED_REASON : ''}>
+                            <Button
+                                size="large"
+                                icon={<BulbOutlined />}
+                                onClick={handleInterpret}
+                                disabled={interpretationBlocked}
+                            >
+                                Biological Interpretation
+                            </Button>
+                        </Tooltip>
 
                         <Button
                             icon={<ReloadOutlined />}

@@ -104,7 +104,7 @@ Return JSON with SPECIFIC, testable hypotheses:
       "quantitativePrediction": "Specific numerical prediction if hypothesis is correct",
       "confidence": "high" | "medium" | "low",
       "confidenceRationale": "Why this confidence level (cite specific evidence)",
-      "novelty": "novel" | "builds-on-known" | "confirmatory"
+      "novelty": "novel" | "extended" | "confirmatory"
     }
   ],
   "centralMechanisticModel": "Overall unifying model integrating multiple pathways with specific molecular details (5-6 sentences, cite specific genes with fold changes)",
@@ -554,8 +554,9 @@ Return ONLY the Mermaid diagram code (starting with "graph TD").`;
       result.hypotheses.forEach((h, idx) => {
         const confidence = h.confidence === 'high' ? '⭐⭐⭐' :
                           h.confidence === 'medium' ? '⭐⭐' : '⭐';
+        // 'builds-on-known' is the pre-rename label; the model may still emit it.
         const noveltyBadge = h.novelty === 'novel' ? '🆕' :
-                            h.novelty === 'builds-on-known' ? '🔨' : '✓';
+                            (h.novelty === 'extended' || h.novelty === 'builds-on-known') ? '🔨' : '✓';
 
         section += `### Hypothesis ${idx + 1}: ${h.hypothesis} ${confidence} ${noveltyBadge}\n\n`;
 

@@ -3,6 +3,8 @@
 
 import { Meteor } from 'meteor/meteor';
 import { validateDataFormat, quickValidate } from '../../llm/validators/dataValidator.js';
+import { derivePgseaPersistPayload } from '/imports/utils/pgseaInput';
+import { resolveInputTypePolicy } from '/imports/utils/inputTypePolicy';
 
 Meteor.methods({
   /**
@@ -24,6 +26,15 @@ Meteor.methods({
 
     if (!fileContent || typeof fileContent !== 'string') {
       throw new Meteor.Error('invalid-file-content', 'File content must be a non-empty string');
+    }
+
+    // pgseaRequireStatsColumns: the parser's own 3-column check is deterministic, so a file that
+    // breaks it is reported exactly that way rather than leaving the verdict to the LLM.
+    if (inputType === 'pgsea' && resolveInputTypePolicy(Meteor.settings.private).pgseaRequireStatsColumns) {
+      const { error } = derivePgseaPersistPayload(fileContent, { requireStats: true });
+      if (error) {
+        return { valid: false, errors: [error.replace(/^PGSEA Analysis:\s*/, '')] };
+      }
     }
 
     // Quick validation first (basic checks)

@@ -10,8 +10,16 @@ import {
     parsePgseaGeneStats,
     derivePgseaPersistPayload,
     buildPgseaVolcanoRows,
+    buildPgseaGeneStatRows,
+    adjustPValuesBH,
+    defaultPgseaRankingBy,
     RANKING_OPTIONS,
+    PGSEA_LOG2_WARNING,
+    applyPgseaFcScale,
+    normalizePgseaFcScale,
+    resolvePgseaFcScale,
 } from "../imports/utils/pgseaInput";
+import { SE_MAX } from "../imports/utils/pgseaLogFCSE";
 
 // Mirrors the OSD statDat_*.txt files (tab-separated, header row).
 const STATDAT_3COL =
@@ -21,12 +29,14 @@ const STATDAT_3COL =
     "H19\t0.0243564833727325\t0.94546077707872";
 
 describe("normalizePgseaInput — 3-column Gene/Fold-Change/P-value (header)", function () {
-    it("detects the header, both ranking options, and defaults to fold-change", function () {
+    it("detects the header, both ranking options, and defaults to signed -log10(P-value)", function () {
+        // With a p-value column the default is sign(FC)*-log10(P) — it uses direction AND
+        // significance, the closest analogue of the moderated t expression analyses rank by.
         const r = normalizePgseaInput(STATDAT_3COL);
         assert.strictEqual(r.hadHeader, true);
         assert.strictEqual(r.delimiter, "\t");
         assert.deepStrictEqual(r.available, ["fc", "pval"]);
-        assert.strictEqual(r.rankingBy, "fc");
+        assert.strictEqual(r.rankingBy, "pval");
         assert.strictEqual(r.rows.length, 3);
         assert.deepStrictEqual(r.rows[0], {
             gene: "GNAI3",
@@ -38,11 +48,13 @@ describe("normalizePgseaInput — 3-column Gene/Fold-Change/P-value (header)", f
 
     it("returns the shape FileParser.parsePGSEAFiles/MassAnalysisModal depend on", function () {
         // FileParser.parsePGSEAFiles spreads this into analysis.data; the mass-analysis
-        // submit path reads data.rows / data.available / data.content / data.rankingBy.
+        // submit path reads data.rows / data.available / data.content / data.rankingBy, and
+        // data.fcAllPositive for its fold-change-scale prompt.
         const r = normalizePgseaInput(STATDAT_3COL);
         assert.deepStrictEqual(
             Object.keys(r).sort(),
-            ["available", "content", "delimiter", "hadHeader", "rankingBy", "rows"].sort()
+            ["available", "content", "delimiter", "fcAllPositive", "fcScale", "hadHeader", "rankingBy", "rows",
+                "warnings"].sort()
         );
     });
 
@@ -90,7 +102,7 @@ describe("normalizePgseaInput — back-compat & delimiters", function () {
     });
 
     it("handles comma-delimited (.csv) input", function () {
-        const r = normalizePgseaInput("Gene,Fold-Change,P-value\nGNAI3,3.02,0.001\nCDC45,-0.16,0.69");
+        const r = normalizePgseaInput("Gene,Fold-Change,P-value\nGNAI3,3.02,0.001\nCDC45,-0.16,0.69", { rankingBy: "fc" });
         assert.strictEqual(r.delimiter, ",");
         assert.deepStrictEqual(r.available, ["fc", "pval"]);
         assert.strictEqual(r.content, "GNAI3\t3.02\nCDC45\t-0.16");
@@ -183,7 +195,7 @@ describe("normalizePgseaInput — header robustness (audit H1/H2/M4)", function 
             "Gene\tt\tP.Value\tadj.P.Val\n" +
             "UP\t5.1\t0.001\t0.01\n" +
             "DOWN\t-3.2\t0.01\t0.05";
-        const r = normalizePgseaInput(text);
+        const r = normalizePgseaInput(text, { rankingBy: "fc" });
         assert.deepStrictEqual(r.available, ["fc", "pval"]);
         // fc mode uses the t-statistic column verbatim (signed), NOT the p-value.
         assert.strictEqual(r.content, "UP\t5.1\nDOWN\t-3.2");
@@ -194,7 +206,7 @@ describe("normalizePgseaInput — header robustness (audit H1/H2/M4)", function 
 
     it("M4: an expression column named log2CPM is NOT mistaken for fold-change", function () {
         // With a real Fold-Change column present, that one must win over log2CPM.
-        const r = normalizePgseaInput("Gene\tlog2CPM\tFold-Change\tP-value\nA\t7.2\t2.0\t0.01\nB\t6.1\t-1.0\t0.2");
+        const r = normalizePgseaInput("Gene\tlog2CPM\tFold-Change\tP-value\nA\t7.2\t2.0\t0.01\nB\t6.1\t-1.0\t0.2", { rankingBy: "fc" });
         assert.strictEqual(r.content, "A\t2.0\nB\t-1.0", "ranking column must be Fold-Change, not log2CPM");
     });
 });
@@ -248,8 +260,8 @@ describe("resolvePgseaRankingBy", function () {
         assert.strictEqual(resolvePgseaRankingBy([undefined, "pval", "fc"], ["fc", "pval"]), "pval");
         assert.strictEqual(resolvePgseaRankingBy([undefined, undefined, "fc"], ["fc", "pval"]), "fc");
     });
-    it("defaults to 'fc' when no candidate is set", function () {
-        assert.strictEqual(resolvePgseaRankingBy([undefined, undefined], ["fc", "pval"]), "fc");
+    it("defaults to 'pval' when the file has p-values and no candidate is set, else 'fc'", function () {
+        assert.strictEqual(resolvePgseaRankingBy([undefined, undefined], ["fc", "pval"]), "pval");
         assert.strictEqual(resolvePgseaRankingBy([], ["fc"]), "fc");
     });
     it("clamps to the first available mode when the requested one is unavailable", function () {
@@ -536,7 +548,7 @@ describe("RANKING GATE — the signed column wins when no Fold-Change header exi
         "DOWNGENE\t7.0\t-4.0\t0.01";
 
     it("ranks on the signed statistic, not the unsigned magnitude column", function () {
-        const r = normalizePgseaInput(NO_FC_HEADER);
+        const r = normalizePgseaInput(NO_FC_HEADER, { rankingBy: "fc" });
         assert.strictEqual(r.content, "UPGENE\t5.5\nDOWNGENE\t-4.0",
             "expected the signed t column, not AveExpr");
     });
@@ -558,7 +570,7 @@ describe("RANKING GATE — the signed column wins when no Fold-Change header exi
     });
 
     it("falls back to the first numeric column when nothing is signed", function () {
-        const r = normalizePgseaInput("Gene\tScore\tP.Value\nA\t2\t0.01\nB\t1\t0.02");
+        const r = normalizePgseaInput("Gene\tScore\tP.Value\nA\t2\t0.01\nB\t1\t0.02", { rankingBy: "fc" });
         assert.strictEqual(r.content, "A\t2\nB\t1");
     });
 
@@ -572,7 +584,7 @@ describe("RANKING GATE — the signed column wins when no Fold-Change header exi
             const t = i < 210 ? (5 - i / 100) : -(1 + i / 100); // positives first, negatives last
             rows.push(`G${i}\t8.00\t${t.toFixed(2)}\t0.01`);
         }
-        const r = normalizePgseaInput(`Gene\tAveExpr\tt\tP.Value\n${rows.join('\n')}`);
+        const r = normalizePgseaInput(`Gene\tAveExpr\tt\tP.Value\n${rows.join('\n')}`, { rankingBy: 'fc' });
         const firstStat = r.content.split('\n')[0].split('\t')[1];
         assert.notStrictEqual(firstStat, '8.00', 'must not rank on AveExpr (mean expression)');
         assert.strictEqual(firstStat, '5.00', 'expected the signed t column');
@@ -586,7 +598,8 @@ describe("RANKING GATE — the signed column wins when no Fold-Change header exi
         // `score` is stat-named but unsigned here; `t` carries the direction. Preferring the
         // name alone reintroduces the all-positive-sign bug: every gene ranks positive.
         const r = normalizePgseaInput(
-            "Gene\tscore\tt\tP.Value\nUP\t0.9\t5.5\t0.001\nDOWN\t0.8\t-4.0\t0.01"
+            "Gene\tscore\tt\tP.Value\nUP\t0.9\t5.5\t0.001\nDOWN\t0.8\t-4.0\t0.01",
+            { rankingBy: "fc" }
         );
         assert.strictEqual(r.content, "UP\t5.5\nDOWN\t-4.0", "expected t, not score");
         const pv = normalizePgseaInput(
@@ -598,7 +611,7 @@ describe("RANKING GATE — the signed column wins when no Fold-Change header exi
     });
 
     it("still uses a stat-named column when nothing in the file is signed", function () {
-        const r = normalizePgseaInput("Gene\tAveExpr\tscore\tP.Value\nA\t8\t0.9\t0.01\nB\t7\t0.8\t0.02");
+        const r = normalizePgseaInput("Gene\tAveExpr\tscore\tP.Value\nA\t8\t0.9\t0.01\nB\t7\t0.8\t0.02", { rankingBy: "fc" });
         assert.strictEqual(r.content, "A\t0.9\nB\t0.8");
     });
 
@@ -606,7 +619,8 @@ describe("RANKING GATE — the signed column wins when no Fold-Change header exi
         // limma's `B` (log-odds of differential expression) goes negative, but a negative B
         // means "probably not DE", not "down-regulated". `t` is the directional statistic.
         const r = normalizePgseaInput(
-            "Gene\tAveExpr\tt\tB\tP.Value\nA\t8\t5.5\t-1.2\t0.001\nB\t7\t-4.0\t-3.4\t0.01"
+            "Gene\tAveExpr\tt\tB\tP.Value\nA\t8\t5.5\t-1.2\t0.001\nB\t7\t-4.0\t-3.4\t0.01",
+            { rankingBy: "fc" }
         );
         assert.strictEqual(r.content, "A\t5.5\nB\t-4.0", "expected the t column, not B");
     });
@@ -629,7 +643,7 @@ describe("RANKING GATE — real p-value columns whose name contains 'log'", func
     });
 
     it("keeps p-value ranking available when a logFC sits beside a log-named p column", function () {
-        const r = normalizePgseaInput("Gene\tlogFC\tlog.P.Value\nA\t2\t0.01\nB\t-1\t0.5");
+        const r = normalizePgseaInput("Gene\tlogFC\tlog.P.Value\nA\t2\t0.01\nB\t-1\t0.5", { rankingBy: "fc" });
         assert.deepStrictEqual(r.available, ["fc", "pval"]);
         assert.strictEqual(r.content, "A\t2\nB\t-1");
     });
@@ -767,7 +781,7 @@ describe("derivePgseaPersistPayload", function () {
             derivePgseaPersistPayload(RANK_FIXTURE_3COL, { storedRankingBy: "pval" }).rankingBy, "pval");
         assert.strictEqual(
             derivePgseaPersistPayload(RANK_FIXTURE_3COL, { storedRankingBy: "pval", requestedRankingBy: "fc" }).rankingBy, "fc");
-        assert.strictEqual(derivePgseaPersistPayload(RANK_FIXTURE_3COL).rankingBy, "fc");
+        assert.strictEqual(derivePgseaPersistPayload(RANK_FIXTURE_3COL).rankingBy, "pval");
     });
 
     it("rescues literal \\t tabs, and stores the FIXED text as inputRaw so it re-derives", function () {
@@ -805,7 +819,7 @@ describe("derivePgseaPersistPayload", function () {
     });
 
     it("accepts a comma-separated 3-column table", function () {
-        const r = derivePgseaPersistPayload("Gene,Fold-Change,P-value\nA,2,0.01\nB,-1,0.001");
+        const r = derivePgseaPersistPayload("Gene,Fold-Change,P-value\nA,2,0.01\nB,-1,0.001", { requestedRankingBy: "fc" });
         assert.deepStrictEqual(r.available, ["fc", "pval"]);
         assert.strictEqual(r.input, "A\t2\nB\t-1");
     });
@@ -912,5 +926,225 @@ describe("RANKING_OPTIONS", function () {
         for (const opt of RANKING_OPTIONS) {
             assert.strictEqual(resolvePgseaRankingBy([opt.value], ["fc", "pval"]), opt.value);
         }
+    });
+});
+
+describe("defaultPgseaRankingBy", function () {
+    it("is signed -log10(P) when a p-value column exists, else the only mode", function () {
+        assert.strictEqual(defaultPgseaRankingBy(["fc", "pval"]), "pval");
+        assert.strictEqual(defaultPgseaRankingBy(["fc"]), "fc");
+        assert.strictEqual(defaultPgseaRankingBy(["pval"]), "pval");
+        assert.strictEqual(defaultPgseaRankingBy(undefined), "fc");
+    });
+
+    it("never overrides a stored choice (stored analyses keep their ranking)", function () {
+        assert.strictEqual(
+            derivePgseaPersistPayload(RANK_FIXTURE_3COL, { storedRankingBy: "fc" }).rankingBy, "fc");
+    });
+});
+
+describe("normalizePgseaInput — requireStats (pgseaRequireStatsColumns)", function () {
+    it("accepts Gene / log2FC / P-value, with or without a header, tab or comma", function () {
+        for (const text of [
+            STATDAT_3COL,
+            "GNAI3\t3.02\t0.001\nCDC45\t-0.16\t0.69",
+            "Gene,log2FC,pvalue\nGNAI3,3.02,0.001\nCDC45,-0.16,0.69",
+        ]) {
+            const r = normalizePgseaInput(text, { requireStats: true });
+            assert.deepStrictEqual(r.available, ["fc", "pval"]);
+        }
+    });
+
+    it("rejects a single-metric file with a message naming the expected format", function () {
+        assert.throws(
+            () => normalizePgseaInput("GNAI3\t3.02\nCDC45\t-0.16", { requireStats: true }),
+            /^Error: PGSEA Analysis: Expected 3 columns: Gene<TAB>Fold-Change<TAB>P-value/
+        );
+        assert.throws(() => normalizePgseaInput("Gene\tFold-Change\nA\t2", { requireStats: true }), /Expected 3 columns/);
+    });
+
+    it("rejects a p-value-only file (no fold change to carry)", function () {
+        assert.throws(() => normalizePgseaInput("Gene\tP-value\nA\t0.01\nB\t0.5", { requireStats: true }), /Expected 3 columns/);
+    });
+
+    it("still accepts a single-metric file when the requirement is off (stored analyses)", function () {
+        assert.doesNotThrow(() => normalizePgseaInput("GNAI3\t3.02\nCDC45\t-0.16"));
+        assert.doesNotThrow(() => normalizePgseaInput("GNAI3\t3.02\nCDC45\t-0.16", { requireStats: false }));
+    });
+
+    it("derivePgseaPersistPayload reports the requirement as an error instead of throwing", function () {
+        const r = derivePgseaPersistPayload("GNAI3\t3.02\nCDC45\t-0.16", { requireStats: true });
+        assert.match(r.error, /Expected 3 columns/);
+        const ok = derivePgseaPersistPayload(RANK_FIXTURE_3COL, { requireStats: true });
+        assert.strictEqual(ok.error, null);
+    });
+});
+
+describe("normalizePgseaInput — log2 fold-change warning", function () {
+    it("observes, without blocking, a fold-change column with no negative values", function () {
+        const r = normalizePgseaInput("Gene\tFold-Change\tP-value\nA\t1.2\t0.01\nB\t0.8\t0.5", { requireStats: true });
+        assert.deepStrictEqual(r.warnings, [PGSEA_LOG2_WARNING]);
+        assert.match(PGSEA_LOG2_WARNING, /^No negative values found/);
+    });
+
+    it("stays quiet when the column is signed, and for a single-metric file", function () {
+        assert.deepStrictEqual(normalizePgseaInput(STATDAT_3COL).warnings, []);
+        assert.deepStrictEqual(normalizePgseaInput("A\t1\nB\t2").warnings, []);
+    });
+});
+
+// A linear fold-change table: CDC45 is down (0.25 → log2 -2), H19 unchanged (1 → 0).
+const LINEAR_3COL =
+    "Gene\tFold-Change\tP-value\n" +
+    "GNAI3\t4\t0.001\n" +
+    "CDC45\t0.25\t0.01\n" +
+    "H19\t1\t0.9";
+
+describe("fold-change scale (log2 default, linear declared by the user)", function () {
+    it("treats an absent or unknown scale as log2, so stored analyses are unchanged", function () {
+        assert.strictEqual(normalizePgseaFcScale(undefined), "log2");
+        assert.strictEqual(normalizePgseaFcScale("weird"), "log2");
+        assert.strictEqual(normalizePgseaFcScale("linear"), "linear");
+        const before = normalizePgseaInput(STATDAT_3COL);
+        const after = normalizePgseaInput(STATDAT_3COL, { fcScale: "log2" });
+        assert.deepStrictEqual(after.rows, before.rows);
+        assert.strictEqual(after.content, before.content);
+        assert.strictEqual(before.fcScale, "log2");
+    });
+
+    it("resolves per-dataset override → group → type default, skipping 'inherit'", function () {
+        assert.strictEqual(resolvePgseaFcScale(["inherit", "linear", "log2"]), "linear");
+        assert.strictEqual(resolvePgseaFcScale([undefined, undefined, "linear"]), "linear");
+        assert.strictEqual(resolvePgseaFcScale(["log2", "linear"]), "log2");
+        assert.strictEqual(resolvePgseaFcScale([]), "log2");
+    });
+
+    it("converts a linear column to log2 at the row level", function () {
+        const r = normalizePgseaInput(LINEAR_3COL, { fcScale: "linear" });
+        assert.deepStrictEqual(r.rows.map(x => x.fc), [2, -2, 0]);
+        assert.strictEqual(r.fcScale, "linear");
+        assert.strictEqual(r.fcAllPositive, true); // describes the upload, not the converted values
+    });
+
+    // Item 1: buildPgseaContent prefers the verbatim token, so it must not leak the linear value.
+    it("emits the converted value in the fc ranking text, not the original linear token", function () {
+        const r = normalizePgseaInput(LINEAR_3COL, { fcScale: "linear", rankingBy: "fc" });
+        assert.strictEqual(buildPgseaContent(r.rows, "fc"), "GNAI3\t2\nCDC45\t-2\nH19\t0");
+    });
+
+    it("signs the p-value ranking by the converted direction (down genes rank negative)", function () {
+        const r = normalizePgseaInput(LINEAR_3COL, { fcScale: "linear" });
+        const stats = buildPgseaContent(r.rows, "pval").split("\n").map(l => parseFloat(l.split("\t")[1]));
+        assert.ok(stats[0] > 0 && stats[1] < 0 && stats[2] === 0);
+    });
+
+    // Item 3: a non-positive value is invalid on a linear scale.
+    it("rejects a value <= 0 under linear, naming the row and gene", function () {
+        const bad = "Gene\tFC\tP\nA\t2\t0.01\nB\t0\t0.02\nC\t-1\t0.03";
+        assert.throws(() => normalizePgseaInput(bad, { fcScale: "linear" }),
+            /linear, but row 2 \(gene B\) has fold change 0\b/);
+        assert.doesNotThrow(() => normalizePgseaInput(bad)); // fine as log2
+    });
+
+    it("does not mutate the rows it converts", function () {
+        const rows = [{ gene: "A", fc: 4, pval: 0.1, fcRaw: "4" }];
+        applyPgseaFcScale(rows, "linear");
+        assert.deepStrictEqual(rows, [{ gene: "A", fc: 4, pval: 0.1, fcRaw: "4" }]);
+        assert.strictEqual(applyPgseaFcScale(rows, "log2"), rows);
+    });
+
+    // Item 7: the sanity note stays for log2, and is meaningless (so absent) under linear.
+    it("keeps the all-positive note only while the scale is log2", function () {
+        assert.deepStrictEqual(normalizePgseaInput(LINEAR_3COL).warnings, [PGSEA_LOG2_WARNING]);
+        assert.deepStrictEqual(normalizePgseaInput(LINEAR_3COL, { fcScale: "linear" }).warnings, []);
+    });
+
+    it("persists the declared scale with input and keeps inputRaw verbatim", function () {
+        const p = derivePgseaPersistPayload(LINEAR_3COL, { fcScale: "linear", requestedRankingBy: "fc" });
+        assert.strictEqual(p.inputRaw, LINEAR_3COL);
+        assert.strictEqual(p.input, "GNAI3\t2\nCDC45\t-2\nH19\t0");
+        assert.strictEqual(p.fcScale, "linear");
+        assert.strictEqual(p.fcAllPositive, true);
+        assert.strictEqual(derivePgseaPersistPayload(LINEAR_3COL).fcScale, "log2");
+    });
+
+    it("flags a linear-scale violation as rejected, unlike an unreadable file", function () {
+        const p = derivePgseaPersistPayload("Gene\tFC\tP\nA\t2\t0.01\nB\t-1\t0.02", { fcScale: "linear" });
+        assert.strictEqual(p.scaleRejected, true);
+        assert.match(p.error, /gene B/);
+        assert.strictEqual(derivePgseaPersistPayload("just one column", { fcScale: "linear" }).scaleRejected, false);
+    });
+
+    // Items 2 and the DE-gene path: the server re-parses inputRaw with the stored scale, so the
+    // stored FC (thresholded by minLogFoldChange, exponentiated for display, signed for meta
+    // direction, fed to logFCSE) is log2.
+    it("gives the volcano / DEGenes path log2 FC when the stored scale is linear", function () {
+        const { pcaData } = buildPgseaVolcanoRows({ inputRaw: LINEAR_3COL, fcScale: "linear" });
+        assert.deepStrictEqual(pcaData.map(r => r.FC), [2, -2, 0]);
+        const { rows } = buildPgseaGeneStatRows(pcaData);
+        assert.ok(rows.every(r => Number.isFinite(r.logFCSE)));
+        // and an absent scale is still read verbatim, exactly as before
+        const legacy = buildPgseaVolcanoRows({ inputRaw: LINEAR_3COL });
+        assert.deepStrictEqual(legacy.pcaData.map(r => r.FC), [4, 0.25, 1]);
+    });
+
+    it("thresholds |FC| on the log2 scale after conversion", function () {
+        const { pcaData } = buildPgseaVolcanoRows({ inputRaw: LINEAR_3COL, fcScale: "linear" });
+        const passing = pcaData.filter(r => Math.abs(r.FC) >= 1).map(r => r.id);
+        assert.deepStrictEqual(passing, ["GNAI3", "CDC45"]); // H19 (linear 1, log2 0) correctly excluded
+    });
+});
+
+describe("adjustPValuesBH", function () {
+    it("matches R's p.adjust(method = 'fdr') and keeps input order", function () {
+        // p.adjust(c(0.01, 0.04, 0.03, 0.2), "fdr") = 0.04 0.05333333 0.05333333 0.20
+        const out = adjustPValuesBH([0.01, 0.04, 0.03, 0.2]);
+        [0.04, 0.16 / 3, 0.16 / 3, 0.2].forEach((v, i) => assert.ok(Math.abs(out[i] - v) < 1e-12, `${i}: ${out[i]}`));
+    });
+});
+
+describe("buildPgseaGeneStatRows — the rows stored as volcanoPlotData AND DEGenes", function () {
+    const PCA = [
+        { id: "UP", FC: 2.0, pValue: 0.01 },
+        { id: "DOWN", FC: -1.5, pValue: 0.001 },
+        { id: "NULL", FC: 0.1, pValue: 0.9 },
+        { id: "BAD", FC: 1.0, pValue: 7 },
+    ];
+
+    it("keeps every uploaded row with statistics — no significance filter", function () {
+        const { rows, invalidP } = buildPgseaGeneStatRows(PCA);
+        assert.deepStrictEqual(rows.map((r) => r.id), ["UP", "DOWN", "NULL"],
+            "the non-significant NULL gene must stay; only the non-probability p is dropped");
+        assert.strictEqual(invalidP, 1);
+    });
+
+    it("carries FC, raw p, BH FDR and a finite derived logFCSE on every row", function () {
+        const { rows } = buildPgseaGeneStatRows(PCA);
+        for (const r of rows) {
+            for (const k of ["FC", "pValue", "pValueFDR", "logFCSE"]) {
+                assert.ok(Number.isFinite(r[k]), `${r.id}.${k} = ${r[k]}`);
+            }
+        }
+        const down = rows.find((r) => r.id === "DOWN");
+        assert.ok(Math.abs(down.pValueFDR - 0.003) < 1e-12, `BH over the 3 valid rows, got ${down.pValueFDR}`);
+    });
+
+    it("maps uploaded ids to GeneIDs, keeps the uploaded id as symbol, drops and counts unmapped", function () {
+        const mapped = [{ from: 7157, to: "UP" }, { from: "1956", to: "DOWN" }];
+        const { rows, unmapped } = buildPgseaGeneStatRows(PCA, { mappedGeneIds: mapped });
+        assert.deepStrictEqual(rows.map((r) => [r.id, r.symbol]), [["7157", "UP"], ["1956", "DOWN"]]);
+        assert.strictEqual(unmapped, 1);
+    });
+
+    it("keeps the most significant row when several uploaded ids map to one GeneID", function () {
+        const mapped = [{ from: "1", to: "UP" }, { from: "1", to: "DOWN" }];
+        const { rows } = buildPgseaGeneStatRows(PCA, { mappedGeneIds: mapped });
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0].symbol, "DOWN");
+    });
+
+    it("gives a zero fold change the maximum SE (no weight), not exclusion", function () {
+        const { rows } = buildPgseaGeneStatRows([{ id: "Z", FC: 0, pValue: 0.5 }]);
+        assert.strictEqual(rows[0].logFCSE, SE_MAX);
     });
 });

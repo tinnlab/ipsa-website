@@ -1,7 +1,7 @@
 import React, {useState, useEffect} from 'react';
 import {Card, Menu} from 'antd';
 
-const MarkdownTableOfContents = ({headings}) => {
+const MarkdownTableOfContents = ({headings, offsetTop = 20}) => {
     const [selectedKey, setSelectedKey] = useState('');
     const [activeKey, setActiveKey] = useState('');
 
@@ -90,8 +90,12 @@ const MarkdownTableOfContents = ({headings}) => {
             title="Table of Contents"
             style={{
                 position: 'sticky',
-                top: 20,
-                maxHeight: 'calc(100vh - 40px)',
+                // offsetTop is measured by the host, not guessed here: the rail has to clear the
+                // app header AND the report's own sticky toolbar, whose height changes with the
+                // report title and breadcrumb trail. Falls back to the old flush-to-top value
+                // when no host supplies one.
+                top: offsetTop,
+                maxHeight: `calc(100vh - ${offsetTop + 20}px)`,
                 overflowY: 'auto'
             }}
             bodyStyle={{padding: 0}}

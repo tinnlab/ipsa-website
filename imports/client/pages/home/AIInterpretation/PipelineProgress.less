@@ -1,5 +1,7 @@
 .pipeline-progress {
-    padding: 24px;
+    // Horizontal padding is 8px, not 24px: at 8 steps every pixel of it comes off the row. See the
+    // one-row arithmetic above the min-width: 840px block at the bottom of this file.
+    padding: 24px 8px;
     background: #fafafa;
     border-radius: 8px;
     margin: 16px 0;
@@ -17,9 +19,11 @@
         display: flex;
         flex-direction: column;
         align-items: center;
-        min-width: 80px;
-        max-width: 120px;
-        flex: 0 0 auto;
+        // Shrinkable (flex: 0 1 auto) so a long pipeline compresses to fit one row rather than
+        // wrapping; min-width is the floor the one-row arithmetic is computed from.
+        min-width: 76px;
+        max-width: 112px;
+        flex: 0 1 auto;
 
         .step-circle {
             width: 44px;
@@ -79,7 +83,8 @@
         .step-label {
             margin-top: 8px;
             text-align: center;
-            max-width: 100px;
+            // Follows the node once it shrinks. A fixed 100px would overflow a compressed node.
+            max-width: 100%;
 
             .step-name {
                 font-size: 11px;
@@ -115,9 +120,10 @@
         display: flex;
         align-items: center;
         height: 44px;
-        width: 40px;
+        width: 28px;
+        min-width: 12px;
         position: relative;
-        flex-shrink: 0;
+        flex: 0 1 auto;
 
         .connector-line {
             position: absolute;
@@ -216,6 +222,34 @@
     to {
         opacity: 1;
         transform: translateY(0);
+    }
+}
+
+// One row, guaranteed — but only where the arithmetic says it fits.
+//
+// The longest pipeline is the meta-analysis one at 8 steps (interpretation-api server.py builds 8
+// entries when the run has genes; a single analysis is 5). That is 8 nodes + 7 connectors, which
+// compress to a floor of 8x76 + 7x12 = 692px.
+//
+// The overlay card's `width: 90%` and `max-width` are CONTENT widths (its 24px padding sits outside
+// them), so the row's usable width is min(1040, 0.9*vw) minus this block's 8px each side:
+//
+//     vw 1600  ->  1040 - 16 = 1024px   (measured: nodes settle at 76..112px, 955px used)
+//     vw  840  ->   756 - 16 =  740px   (measured: exactly 740px used, one row, no overflow)
+//
+// One row needs that to be >= 692px, i.e. 0.9*vw >= 708, i.e. vw >= 787px. This query is gated at
+// 840px, which is the same rule with ~50px of margin rather than sitting on the boundary.
+//
+// Below the gate the container keeps flex-wrap: wrap (the base rule) and 8 steps wrap onto two
+// rows. That is deliberate: forcing nowrap down there would overflow the card instead, and an
+// overflow is a worse failure than a wrap. Measured at vw 839: wraps to 2 rows, scrollWidth ==
+// clientWidth, no overflow.
+//
+// For reference, the wrap this fixes: before the change the card was max-width 800 with 24px
+// padding here, giving the row 752px, and 8 nodes at 80..100px with 40px connectors needed 1015px.
+@media (min-width: 840px) {
+    .pipeline-progress .pipeline-container {
+        flex-wrap: nowrap;
     }
 }
 

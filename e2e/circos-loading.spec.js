@@ -4,7 +4,7 @@
 // pathways (the "blink" bug).
 //
 // Needs a COMPLETED analysis session whose Circos plot has results:
-//   E2E_BASE_URL=http://localhost:18000 \
+//   E2E_BASE_URL=https://ipsa.tinnguyenlab.com \
 //   E2E_VIZ_PATH=/analysis/visualization/<sessionId>?analysisId=<analysisId> \
 //   npx playwright test e2e/circos-loading.spec.js
 // Without E2E_VIZ_PATH the spec is skipped.
@@ -27,14 +27,21 @@ test.describe('Circos plot loading vs no-data', () => {
     // Give the multi-stage async pipeline time to settle, then assert the FINAL
     // state is a rendered chart (svg/canvas), not the empty message. The empty
     // message is only acceptable as a final state if there is genuinely no chart.
-    const chart = page.locator('svg, canvas').first();
+    // Scoped to the Circos SVG's own id (circos-d3 sets id="circos-svg-<chartId>"). A bare
+    // 'svg, canvas' matches any antd icon on the page — including the plot's own SVG/PNG
+    // export buttons — so it was satisfied before a chart existed.
+    const chart = page.locator('svg[id^="circos-svg-"]').first();
     const noPathway = page.getByText(/no significant pathways were identified/i).first();
+    // A third settled state: pathways ARE displayed but none of them contains a
+    // differentially expressed gene, so there are no chords to draw.
+    const nothingToConnect = page.getByText(/nothing to connect/i).first();
 
     await expect
       .poll(async () => {
         const hasChart = await chart.isVisible().catch(() => false);
         const hasEmpty = await noPathway.isVisible().catch(() => false);
-        return hasChart || hasEmpty;
+        const hasNoGenes = await nothingToConnect.isVisible().catch(() => false);
+        return hasChart || hasEmpty || hasNoGenes;
       }, { timeout: 30_000 })
       .toBeTruthy();
 

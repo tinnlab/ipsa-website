@@ -36,6 +36,9 @@ const filterOption = (input, option) => {
  * @param {(ids:Array)=>void} onLabelChange
  * @param {boolean} hideNonFocused   hide the non-focused cloud & rescale to the focus set
  * @param {(v:boolean)=>void} onHideNonFocusedChange
+ * @param {boolean} dimNonFocused   grey out the non-focused cloud (off by default, so
+ *   focusing keeps the up/down colours of the whole experiment)
+ * @param {(v:boolean)=>void} onDimNonFocusedChange
  * @param {Array<{id:*,name:string,FC:number,pValue:number}>} volcanoPlotData
  * @param {{maxAdjustedPValue:number,minLogFoldChange:number}} deSettings
  */
@@ -50,6 +53,8 @@ export default ({
                     onLabelChange,
                     hideNonFocused,
                     onHideNonFocusedChange,
+                    dimNonFocused,
+                    onDimNonFocusedChange,
                     volcanoPlotData,
                     deSettings,
                 }) => {
@@ -233,6 +238,21 @@ export default ({
                         onChange={(e) => onHideNonFocusedChange(e.target.checked)}
                     >
                         Hide non-focused genes
+                    </Checkbox>
+                )}
+                {/* Sits beside "Hide non-focused" because both govern what happens to
+                    genes outside the focus set. Disabled once the cloud is hidden, where
+                    there is nothing left to dim — and it reads false there too, because
+                    the plot is not dimmed and a ticked-but-disabled box would assert a
+                    state the chart is not in. The preference itself is kept, so unticking
+                    Hide brings the dimming back rather than silently forgetting it. */}
+                {focusCount > 0 && (
+                    <Checkbox
+                        checked={dimNonFocused && !hideNonFocused}
+                        disabled={hideNonFocused}
+                        onChange={(e) => onDimNonFocusedChange(e.target.checked)}
+                    >
+                        Dim non-focused genes
                     </Checkbox>
                 )}
             </Space>
