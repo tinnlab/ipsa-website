@@ -1,6 +1,7 @@
 import Papa from 'papaparse';
 import { Meteor } from 'meteor/meteor';
 import { normalizePgseaInput } from '/imports/utils/pgseaInput';
+import { resolveInputTypePolicy } from '/imports/utils/inputTypePolicy';
 
 class FileParser {
     static async parseFolder(fileList, useLLMDetection = false, progressCallback = null) {
@@ -802,7 +803,11 @@ Only include groups that need merging. If a field has no duplicates, don't inclu
     static createFallbackCommonFieldsAnalysis(metadataMap) {
         try {
             const totalDatasets = metadataMap.size;
-            const minCoverage = Math.floor(totalDatasets * 0.6); // 60% coverage threshold
+            // Standardize Metadata removes the fields that not all datasets share (paper,
+            // suppl.), so a field is kept only when every dataset has it. The former 60%
+            // rule (Math.floor made it lower still: 3 of 5, 2 of 4) is commented out.
+            // const minCoverage = Math.floor(totalDatasets * 0.6); // 60% coverage threshold
+            const minCoverage = totalDatasets;
 
             // Count field occurrences across datasets (case-insensitive)
             const fieldOccurrences = new Map(); // lowercase field name -> {canonical: string, datasets: Set, variants: Set}
@@ -825,7 +830,7 @@ Only include groups that need merging. If a field has no duplicates, don't inclu
                 }
             });
 
-            // Find common fields (appear in >= 60% of datasets)
+            // Find common fields (present in every dataset)
             const commonFields = [];
             const datasetMappings = {};
             const missingFields = {};
@@ -1422,6 +1427,17 @@ Response (just the filename or NO_MATCH):`;
         };
     }
 
+    // The server's input-type flags (imports/utils/inputTypePolicy.js), fetched once. Falls back
+    // to the shipped defaults if the method is unreachable — the server enforces them anyway.
+    static async getInputTypePolicy() {
+        if (!this._inputTypePolicy) {
+            this._inputTypePolicy = Meteor.callAsync('inputTypePolicy.get')
+                .catch(() => ({}))
+                .then((policy) => resolveInputTypePolicy(policy || {}));
+        }
+        return this._inputTypePolicy;
+    }
+
     // UPDATED: parsePGSEAFiles method - Exclude metadata.txt and system files
     static async parsePGSEAFiles(files, llmDetection = null) {
         // Use LLM-detected file name if available
@@ -1453,27 +1469,43 @@ Response (just the filename or NO_MATCH):`;
         }
 
         if (!dataFile) {
-            throw new Error(`PGSEA Analysis: No suitable data file found. Expected "${primaryFileName || 'ranked gene file'}" (.txt, .tsv, or .csv).`);
+            throw new Error(`PGSEA Analysis: No suitable data file found. Expected "${primaryFileName || 'ranked gene list file with statistics'}" (.txt, .tsv, or .csv).`);
         }
 
         const content = await this.readFileContent(dataFile.file);
 
         // Accept the historical `Gene / Fold-Change / P-value` table (optional header,
         // 2 or 3 columns) and normalize to the canonical 2-column `Gene\tStatistic`
-        // string the backend consumes (createPgseaParams). Ranking defaults to
-        // Fold-Change at parse time — which makes the output identical to a plain
-        // `Gene\tFoldChange` file — and the mass-analysis UI can recompute `content`
-        // for the P-value ranking via buildPgseaContent(rows, rankingBy) without
+        // string the backend consumes (createPgseaParams). Ranking defaults to the file's
+        // default (signed -log10(P) when it has p-values) unless the detection chose one, and
+        // the mass-analysis UI can recompute `content`
+        // via buildPgseaContent(rows, rankingBy) without
         // re-reading the file. See imports/utils/pgseaInput.js.
-        const rankingBy = llmDetection?.rankingBy || 'fc';
-        const normalized = normalizePgseaInput(content, { rankingBy });
+        //
+        // Under pgseaRequireStatsColumns a file without fold-change AND p-value columns is
+        // refused here, naming the expected format (the server checks again).
+        const { pgseaRequireStatsColumns } = await this.getInputTypePolicy();
+        let normalized;
+        try {
+            normalized = normalizePgseaInput(content, {
+                rankingBy: llmDetection?.rankingBy,
+                requireStats: pgseaRequireStatsColumns
+            });
+        } catch (error) {
+            throw new Error(`${dataFile.name}: ${error.message}`);
+        }
 
         return {
             fileName: dataFile.name,
             content: normalized.content,
+            inputRaw: content,
+            warnings: normalized.warnings,
             rows: normalized.rows,
             available: normalized.available,
             rankingBy: normalized.rankingBy,
+            // Parsed at the default log2 scale. The mass modal applies each dataset's declared
+            // scale at submit (applyPgseaFcScale); this flag drives its "linear?" prompt.
+            fcAllPositive: normalized.fcAllPositive,
             delimiter: normalized.delimiter
         };
     }

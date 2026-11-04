@@ -1,10 +1,11 @@
-import React, {useEffect, useRef, useState} from "react";
+import React, {useCallback, useEffect, useRef, useState} from "react";
 import ReactEcharts from "echarts-for-react";
 import EchartsWrapper from './EchartsWrapper';
 import GeneLoading from "../../../../../components/GeneLoading";
 import {agnes} from 'ml-hclust';
 import {kmeans} from 'ml-kmeans';
-import {Checkbox, Select, Space, Typography, Radio, Slider, Divider, Button} from "antd";
+import {Checkbox, Select, Space, Typography, Radio, Slider, Divider, Button, InputNumber} from "antd";
+import _ from "lodash";
 import { DownloadOutlined } from "@ant-design/icons";
 import { useGlobalSettings } from "../../../../../contexts/GlobalSettingsContext";
 import { buildDisplayOrder, buildPositionMap } from "../../../../../../utils/heatmapOrdering";
@@ -36,6 +37,8 @@ export default ({inputData, genesIdList}) => {
     const [enableDEFilter, setEnableDEFilter] = useState(true)
     const [fdrThreshold, setFdrThreshold] = useState(globalSettings.pValueFDR)
     const [fcThreshold, setFcThreshold] = useState(globalSettings.foldChange)
+    const [customFdrInput, setCustomFdrInput] = useState('')
+    const [customFcInput, setCustomFcInput] = useState('')
     const [filteredGenesCount, setFilteredGenesCount] = useState(0)
 
     const MAX_GENES_FOR_DIRECT_CLUSTERING = 200
@@ -46,6 +49,17 @@ export default ({inputData, genesIdList}) => {
         setFdrThreshold(globalSettings.pValueFDR);
         setFcThreshold(globalSettings.foldChange);
     }, [globalSettings]);
+
+    // Debounced setters for the custom inputs: every threshold change re-runs the DE filter and,
+    // with clustering on, the clustering itself, so don't do that on each keystroke.
+    const debouncedSetFdrThreshold = useCallback(
+        _.debounce((value) => setFdrThreshold(value), 500),
+        []
+    );
+    const debouncedSetFcThreshold = useCallback(
+        _.debounce((value) => setFcThreshold(value), 500),
+        []
+    );
 
     // Initialize selected analyses with all analyses when inputData changes
     useEffect(() => {
@@ -76,8 +90,8 @@ export default ({inputData, genesIdList}) => {
             const isDE = filteredInputData.some(analysis => {
                 const gene = analysis.values[geneIdx]
                 return gene &&
-                       gene.pValueFDR < fdrThreshold &&
-                       Math.abs(gene.FC) > fcThreshold
+                       gene.pValueFDR <= fdrThreshold &&
+                       Math.abs(gene.FC) >= fcThreshold
             })
 
             if (isDE) {
@@ -611,24 +625,70 @@ export default ({inputData, genesIdList}) => {
                         {enableDEFilter && (
                             <>
                                 <Text type="secondary">|</Text>
-                                <Text>FDR &lt;</Text>
+                                <Text>FDR &le;</Text>
                                 <Select
                                     value={fdrThreshold}
                                     onChange={setFdrThreshold}
-                                    style={{width: 80}}
+                                    style={{width: 100}}
                                     size="small"
+                                    dropdownRender={(menu) => (
+                                        <>
+                                            {menu}
+                                            <Divider style={{margin: '8px 0'}} />
+                                            <Space style={{padding: '0 8px 4px'}}>
+                                                <InputNumber
+                                                    placeholder="Custom"
+                                                    value={customFdrInput}
+                                                    onChange={(val) => {
+                                                        if (val !== null && val >= 0 && val <= 1) {
+                                                            setCustomFdrInput(val);
+                                                            debouncedSetFdrThreshold(val);
+                                                        }
+                                                    }}
+                                                    min={0}
+                                                    max={1}
+                                                    step={0.01}
+                                                    size="small"
+                                                    style={{width: 80}}
+                                                />
+                                            </Space>
+                                        </>
+                                    )}
                                 >
                                     <Option value={0.01}>0.01</Option>
                                     <Option value={0.05}>0.05</Option>
                                     <Option value={0.1}>0.1</Option>
                                 </Select>
                                 <Text type="secondary">|</Text>
-                                <Text>|log2FC| &gt;</Text>
+                                <Text>|log2FC| &ge;</Text>
                                 <Select
                                     value={fcThreshold}
                                     onChange={setFcThreshold}
-                                    style={{width: 80}}
+                                    style={{width: 120}}
                                     size="small"
+                                    dropdownRender={(menu) => (
+                                        <>
+                                            {menu}
+                                            <Divider style={{margin: '8px 0'}} />
+                                            <Space style={{padding: '0 8px 4px'}}>
+                                                {/* No upper bound: |log2FC| is not a probability. */}
+                                                <InputNumber
+                                                    placeholder="Custom"
+                                                    value={customFcInput}
+                                                    onChange={(val) => {
+                                                        if (val !== null && val >= 0) {
+                                                            setCustomFcInput(val);
+                                                            debouncedSetFcThreshold(val);
+                                                        }
+                                                    }}
+                                                    min={0}
+                                                    step={0.1}
+                                                    size="small"
+                                                    style={{width: 80}}
+                                                />
+                                            </Space>
+                                        </>
+                                    )}
                                 >
                                     <Option value={0.58}>0.58 (1.5x)</Option>
                                     <Option value={1.0}>1.0 (2x)</Option>

@@ -6,6 +6,7 @@ import {
     ClockCircleOutlined,
     CloseCircleFilled
 } from '@ant-design/icons';
+import { pipelineStepNodes } from '/imports/utils/pipelineSteps';
 import './PipelineProgress.less';
 
 const { Text } = Typography;
@@ -18,22 +19,11 @@ const PipelineProgress = ({
     stepExecutionTimes = {},
     status = 'running'
 }) => {
-    const getStepStatus = (stepNumber) => {
-        if (status === 'failed' && stepNumber === currentStep) {
-            return 'failed';
-        }
-        if (stepNumber < currentStep) {
-            return 'completed';
-        }
-        if (stepNumber === currentStep) {
-            return 'active';
-        }
-        return 'pending';
-    };
+    // Order AND status both come from the declared stepsInfo order — see imports/utils/pipelineSteps
+    // for why neither may be derived from the step NUMBERS (the meta pipeline runs 6 -> 8 -> 7).
+    const stepNodes = pipelineStepNodes(stepsInfo, { totalSteps, currentStep, status });
 
-    const getStepIcon = (stepNumber) => {
-        const stepStatus = getStepStatus(stepNumber);
-
+    const getStepIcon = (stepStatus) => {
         switch (stepStatus) {
             case 'completed':
                 return <CheckCircleFilled className="step-icon completed" />;
@@ -56,22 +46,16 @@ const PipelineProgress = ({
         return `${mins}m ${secs}s`;
     };
 
-    const getStepInfo = (stepNumber) => {
-        return stepsInfo.find(s => s.step === stepNumber) || {
-            step: stepNumber,
-            name: `Step ${stepNumber}`,
-            message: ''
-        };
-    };
-
     return (
         <div className="pipeline-progress">
             <div className="pipeline-container">
-                {Array.from({ length: totalSteps }, (_, index) => {
-                    const stepNumber = index + 1;
-                    const stepInfo = getStepInfo(stepNumber);
-                    const stepStatus = getStepStatus(stepNumber);
+                {stepNodes.map((stepInfo, index) => {
+                    const stepNumber = stepInfo.step;
+                    const stepStatus = stepInfo.status;
                     const executionTime = stepExecutionTimes[`step${stepNumber}`];
+                    // Positional, like everything else here: the connector after a node is filled
+                    // once that node itself is behind the active one.
+                    const connectorDone = stepStatus === 'completed';
 
                     return (
                         <React.Fragment key={stepNumber}>
@@ -94,7 +78,7 @@ const PipelineProgress = ({
                                     placement="top"
                                 >
                                     <div className="step-circle">
-                                        {getStepIcon(stepNumber)}
+                                        {getStepIcon(stepStatus)}
                                     </div>
                                 </Tooltip>
                                 <div className="step-label">
@@ -113,10 +97,10 @@ const PipelineProgress = ({
                             </div>
 
                             {/* Connector line */}
-                            {stepNumber < totalSteps && (
-                                <div className={`step-connector ${stepNumber < currentStep ? 'completed' : ''}`}>
+                            {index < stepNodes.length - 1 && (
+                                <div className={`step-connector ${connectorDone ? 'completed' : ''}`}>
                                     <div className="connector-line" />
-                                    {stepNumber < currentStep && (
+                                    {connectorDone && (
                                         <div className="connector-fill" />
                                     )}
                                 </div>

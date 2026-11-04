@@ -18,7 +18,8 @@ import Dropdown from "antd/lib/dropdown";
 import {DownOutlined} from "@ant-design/icons";
 import WorkspaceModal from "./WorkspaceModal";
 import ShareModal from "./ShareModal";
-import {isSessionExpired, formatDaysLeft} from "../../../../../utils/retention";
+import {isSessionExpired, formatDaysLeft, studyStatusLabel} from "../../../../../utils/retention";
+import {recentStudiesSelector, RECENT_STUDIES_SORT} from "../../../../../utils/recentStudies";
 
 import "./index.style.less";
 
@@ -36,10 +37,11 @@ export default () => {
     const data = useTracker(() => {
         const currentUser = Meteor.user();
         if (!currentUser) return [];
-        return DBCollections.Session.find(
-            {userId: currentUser._id},
-            {sort: {createdAt: -1}}
-        ).fetch();
+        // Shared with the homepage's counted button via recentStudiesSelector, so the number on that
+        // button and the rows on this page cannot come to disagree.
+        const selector = recentStudiesSelector(currentUser._id);
+        if (!selector) return [];
+        return DBCollections.Session.find(selector, {sort: RECENT_STUDIES_SORT}).fetch();
     }, []);
 
     useEffect(() => {
@@ -69,6 +71,12 @@ export default () => {
             dataIndex: "expiredIn",
             key: "expiredIn",
             render: (_, record) => {
+                // A permanent study (a seeded case study) carries no expiredAt at all. Falling
+                // through would be actively misleading: moment(undefined) is NOW, so the diff is ~0,
+                // isExpiringSoon (0 < 5) is true, and the cell renders a RED "0 minutes" — the
+                // strongest possible "about to be deleted" signal on a study that is immortal.
+                if (record.permanent === true) return "Never";
+
                 const expiredAt = moment(record.expiredAt);
                 const currentTime = moment();
 
@@ -96,14 +104,11 @@ export default () => {
             dataIndex: "status",
             key: "status",
             // Reflect the actual expiry signal (same as the sweep) rather than the stored
-            // status, which is only ever "Active" and would mislabel an expired study.
-            render: (status, record) => {
-                if (isSessionExpired({ expiredAt: record.expiredAt, nowMs: Date.now() })) return "Expired";
-                // A study imported in "results only" mode cannot be edited or re-run, so say so
-                // here rather than letting it look like an ordinary study.
-                if (record.readOnly) return "(View only)";
-                return status || "Active";
-            },
+            // status, which is only ever "Active" and would mislabel an expired study; and a
+            // "results only" import, which cannot be edited or re-run, says so rather than looking
+            // like an ordinary study. The rule lives in retention.js because the share-link landing
+            // page shows the same studies in its prior-imports table and the two must not disagree.
+            render: (_, record) => studyStatusLabel(record, Date.now()),
         },
         {
             title: "Actions",
@@ -156,22 +161,27 @@ export default () => {
                                 Remove
                             </Button>
                         </Popconfirm>
-                        <Button
-                            size={"small"}
-                            onClick={async () => {
-                                // Server computes the new expiry (adds the configured retention
-                                // window to the current expiredAt) and enforces ownership — don't
-                                // send a date. asyncCallWithNotification surfaces any error toast
-                                // (matches the sibling Remove handler); the window is operator-
-                                // configurable, so the toast stays generic rather than drift.
-                                await Meteor.asyncCallWithNotification("session.extendExpiration", record._id);
-                                notify.success("Study expiration extended.");
-                            }}
-                            // Intentionally NOT disabled when expired: a study lingers until the
-                            // nightly sweep, so Extend must stay available to rescue it in time.
-                        >
-                            Extend
-                        </Button>
+                        {/* A permanent study has no expiry to extend, and the server now no-ops on
+                            one. Offering the button anyway would fire the success toast below and
+                            report an extension that never happened. */}
+                        {record.permanent !== true && (
+                            <Button
+                                size={"small"}
+                                onClick={async () => {
+                                    // Server computes the new expiry (adds the configured retention
+                                    // window to the current expiredAt) and enforces ownership — don't
+                                    // send a date. asyncCallWithNotification surfaces any error toast
+                                    // (matches the sibling Remove handler); the window is operator-
+                                    // configurable, so the toast stays generic rather than drift.
+                                    await Meteor.asyncCallWithNotification("session.extendExpiration", record._id);
+                                    notify.success("Study expiration extended.");
+                                }}
+                                // Intentionally NOT disabled when expired: a study lingers until the
+                                // nightly sweep, so Extend must stay available to rescue it in time.
+                            >
+                                Extend
+                            </Button>
+                        )}
                     </Space>
                 );
             },

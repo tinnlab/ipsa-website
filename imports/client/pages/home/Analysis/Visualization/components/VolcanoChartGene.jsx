@@ -32,13 +32,21 @@ export default ({analysisId, sessionId, config, handleChangingDESettings}) => {
     const [displayMode, setDisplayMode] = useState('symbol');
     // Hide the non-focused cloud and rescale the axes to just the focused genes.
     const [hideNonFocused, setHideNonFocused] = useState(false);
+    // Grey out the non-focused cloud. OFF by default so focusing genes keeps the
+    // up/down colours of the whole experiment; the focused genes already stand out by
+    // border, size and label. See getGeneVolcanoOptions' header.
+    const [dimNonFocused, setDimNonFocused] = useState(false);
 
     const volcanoPlotData = useMemo(() => {
         if (!fcPValueData || fcPValueData.length === 0) return [];
 
         return fcPValueData.map(e => ({
             FC: e.FC,
-            pValue: config.inputType !== 'expression' ? e.pValue : e.pValueFDR,
+            // The threshold control reads "pValue.FDR ≤": expression rows and pgsea rows (BH
+            // computed by writePgseaDEGenes) carry an FDR; meta-analysis rows keep their pValue.
+            pValue: config.inputType === 'expression' || (config.inputType === 'pgsea' && e.pValueFDR != null)
+                ? e.pValueFDR
+                : e.pValue,
             id: e.id,
             // `name` is the gene SYMBOL for display: prefer the authoritative GeneInfo
             // symbol, then any symbol the row already carries, then the input-id map,
@@ -85,13 +93,16 @@ export default ({analysisId, sessionId, config, handleChangingDESettings}) => {
         setFocusGeneIds(next);
         const focusSet = new Set(next);
         setLabelGeneIds(prev => (prev || []).filter(id => focusSet.has(id)));
-        // Clearing the focus restores the default view, so drop the hide/rescale flag.
-        if (next.length === 0) setHideNonFocused(false);
+        // Clearing the focus restores the default view, so drop the cloud treatments.
+        if (next.length === 0) {
+            setHideNonFocused(false);
+            setDimNonFocused(false);
+        }
     }, []);
 
     const option = useMemo(
-        () => getGeneVolcanoOptions(volcanoPlotData, deSettings, focusGeneIds, labelGeneIds, displayMode, hideNonFocused),
-        [volcanoPlotData, deSettings, focusGeneIds, labelGeneIds, displayMode, hideNonFocused]
+        () => getGeneVolcanoOptions(volcanoPlotData, deSettings, focusGeneIds, labelGeneIds, displayMode, hideNonFocused, dimNonFocused),
+        [volcanoPlotData, deSettings, focusGeneIds, labelGeneIds, displayMode, hideNonFocused, dimNonFocused]
     );
 
     // Export the gene list as CSV. `mode` selects the subset:
@@ -274,6 +285,8 @@ export default ({analysisId, sessionId, config, handleChangingDESettings}) => {
                 onLabelChange={setLabelGeneIds}
                 hideNonFocused={hideNonFocused}
                 onHideNonFocusedChange={setHideNonFocused}
+                dimNonFocused={dimNonFocused}
+                onDimNonFocusedChange={setDimNonFocused}
                 volcanoPlotData={volcanoPlotData}
                 deSettings={deSettings}
             />

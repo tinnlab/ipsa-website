@@ -106,6 +106,28 @@ export const isSessionExpired = ({ expiredAt, nowMs }) => {
 export const selectExpiredSessions = (sessions, nowMs) =>
     (sessions || []).filter((s) => isSessionExpired({ expiredAt: s && s.expiredAt, nowMs }));
 
+export const STUDY_STATUS_EXPIRED = "Expired";
+export const STUDY_STATUS_VIEW_ONLY = "(View only)";
+export const STUDY_STATUS_ACTIVE = "Active";
+
+// The label the Recent Studies list shows in its Status column, as a pure function so a second view
+// of the same study cannot state something different. The share-link landing page's prior-imports
+// table renders the caller's earlier copies of the study being offered, and such a study appears in
+// BOTH places at once — copying the rule rather than sharing it is how the two drift apart.
+//
+// The order is load-bearing. Expiry wins over everything: an expired study is unusable whatever else
+// it is, and it is decided by the same signal the nightly sweep deletes on (isSessionExpired), not
+// by the stored `status`. Then the view-only marker a 'results' import carries. `status` comes last
+// and is only ever written "Active" at creation, so it is a fallback, not a source of truth.
+//
+// Tolerates a missing or malformed session rather than throwing: these rows render on a page with no
+// React error boundary above it, where a throw in one cell blanks the entire page.
+export const studyStatusLabel = (session, nowMs) => {
+    if (isSessionExpired({ expiredAt: session && session.expiredAt, nowMs })) return STUDY_STATUS_EXPIRED;
+    if (session && session.readOnly) return STUDY_STATUS_VIEW_ONLY;
+    return (session && session.status) || STUDY_STATUS_ACTIVE;
+};
+
 // Every analysis id owned by a session: regular analyses PLUS meta-analyses. Used to fan the
 // cascade delete across all per-analysis collections (configs, snapshots, results, logs, ...).
 // De-duplicated; ignores entries without an id. Never throws on malformed input.

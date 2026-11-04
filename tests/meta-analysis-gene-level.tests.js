@@ -1,5 +1,10 @@
 import assert from "assert";
-import {analysisDisplayName, buildGeneLevelData} from "../imports/utils/metaAnalysisGeneLevel";
+import {
+    analysisDisplayName,
+    resolveAnalysisName,
+    nonEmptyLabel,
+    buildGeneLevelData,
+} from "../imports/utils/metaAnalysisGeneLevel";
 
 // Regression for the Meta-analysis tab crash:
 //   "Cannot read properties of undefined (reading 'name')"
@@ -28,6 +33,58 @@ describe("analysisDisplayName (safe name resolution)", function () {
         assert.strictEqual(analysisDisplayName(undefined, "a1", "Config Name"), "Config Name");
         assert.strictEqual(analysisDisplayName(undefined, "a1"), "a1");
     });
+
+    it("does not let an EMPTY name win over one that exists", function () {
+        // `fallbackName ?? …` used to let '' through, rendering blank where a name was available.
+        assert.strictEqual(analysisDisplayName(analyses, "a1", ""), "Liver vs Control");
+        assert.strictEqual(analysisDisplayName(analyses, "a1", "   "), "Liver vs Control");
+        assert.strictEqual(analysisDisplayName({a1: {name: ""}}, "a1"), "a1");
+    });
+});
+
+// Meta-analyses live on Session.metaAnalyses[], a different array from Session.analyses[]. Sites
+// that consulted only the analyses map resolved a meta id to nothing, which surfaced as raw ids in
+// the wizard's review step and tab titles, "Analysis <id>" saved onto reports, and a label that
+// rendered as a lone ':' with no name in front of it.
+describe("resolveAnalysisName / nonEmptyLabel (meta-aware name resolution)", function () {
+    const ANALYSES = {a1: {id: "a1", name: "Liver vs Control"}};
+    const META_ANALYSES = [{id: "m1", name: "Liver meta-analysis"}];
+
+    it("resolves a meta-analysis id to its name", function () {
+        assert.strictEqual(resolveAnalysisName(ANALYSES, "m1", META_ANALYSES), "Liver meta-analysis");
+    });
+
+    it("resolves an ordinary analysis id to its name", function () {
+        assert.strictEqual(resolveAnalysisName(ANALYSES, "a1", META_ANALYSES), "Liver vs Control");
+    });
+
+    it("returns undefined — not '' and not the id — when nothing names the id", function () {
+        assert.strictEqual(resolveAnalysisName(ANALYSES, "ghost", META_ANALYSES), undefined);
+        assert.strictEqual(resolveAnalysisName(undefined, "ghost", undefined), undefined);
+    });
+
+    it("skips a meta entry whose name is empty rather than returning it", function () {
+        assert.strictEqual(resolveAnalysisName({}, "m2", [{id: "m2", name: ""}]), undefined);
+    });
+
+    it("routes the meta name through analysisDisplayName's 4th argument", function () {
+        assert.strictEqual(
+            analysisDisplayName(ANALYSES, "m1", undefined, META_ANALYSES), "Liver meta-analysis"
+        );
+        // Existing 3-arg callers are unaffected: still the raw id for an unknown meta id.
+        assert.strictEqual(analysisDisplayName(ANALYSES, "m1"), "m1");
+    });
+
+    it("never yields an empty label, so a following ':' can never stand alone", function () {
+        assert.strictEqual(nonEmptyLabel("Liver vs Control"), "Liver vs Control");
+        assert.strictEqual(nonEmptyLabel(""), "Unnamed analysis");
+        assert.strictEqual(nonEmptyLabel(undefined), "Unnamed analysis");
+        assert.strictEqual(nonEmptyLabel(null), "Unnamed analysis");
+        assert.strictEqual(nonEmptyLabel("   "), "Unnamed analysis");
+        assert.strictEqual(nonEmptyLabel("", "Unnamed database"), "Unnamed database");
+        // Even a caller that passes an empty fallback cannot produce a bare colon.
+        assert.strictEqual(nonEmptyLabel("", ""), "Unnamed");
+    });
 });
 
 describe("buildGeneLevelData (gene-level meta-analysis selection)", function () {
@@ -50,7 +107,7 @@ describe("buildGeneLevelData (gene-level meta-analysis selection)", function () 
         assert.strictEqual(result.expressionData.length, 1);
     });
 
-    it("includes only Expression analyses (excludes PGSEA and ORA)", function () {
+    it("includes Expression and PGSEA analyses (excludes ORA)", function () {
         const configs = {
             a1: {analysisId: "a1", inputType: "expression", name: "Expr A1", hasGeneResults: true},
             a2: {analysisId: "a2", inputType: "pgsea", name: "PGSEA A2", hasGeneResults: true},
@@ -64,14 +121,26 @@ describe("buildGeneLevelData (gene-level meta-analysis selection)", function () 
 
         const {expressionData, geneTreeData, initialSelectedItems} = buildGeneLevelData(configs, analyses);
 
-        assert.deepStrictEqual(initialSelectedItems, ["a1", "a4"]);
-        assert.strictEqual(expressionData.length, 2);
-        assert.deepStrictEqual(geneTreeData.map(t => t.title), ["Expr A1", "Expr A4"]);
-        // Both have results, so every expression entry is pre-selected.
+        assert.deepStrictEqual(initialSelectedItems, ["a1", "a2", "a4"]);
+        assert.strictEqual(expressionData.length, 3);
+        assert.deepStrictEqual(geneTreeData.map(t => t.title), ["Expr A1", "PGSEA A2", "Expr A4"]);
+        // All have results, so every entry is pre-selected.
         assert.deepStrictEqual(
             initialSelectedItems,
             geneTreeData.map(t => t.value)
         );
+    });
+
+    it("keeps a single-metric PGSEA analysis (no gene-level rows) disabled, with the reason", function () {
+        // A PGSEA upload without fold-change AND p-value columns gets no volcanoPlotData, so
+        // hasGeneResults is falsy and it must not feed the meta-analysis.
+        const configs = {
+            p1: {analysisId: "p1", inputType: "pgsea", name: "Legacy P1"},
+        };
+        const {geneTreeData, initialSelectedItems} = buildGeneLevelData(configs, {});
+        assert.deepStrictEqual(initialSelectedItems, []);
+        assert.strictEqual(geneTreeData[0].title, "Legacy P1 (No fold-change and p-value statistics)");
+        assert.strictEqual(geneTreeData[0].disabled, true);
     });
 
     it("keeps not-run expression analyses in the tree but disabled and unselected", function () {

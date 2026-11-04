@@ -116,7 +116,7 @@
 //     </div>
 // )
 
-import React from 'react';
+import React, {useState} from 'react';
 import {Link, useNavigate} from 'react-router-dom';
 import {
     Button,
@@ -137,12 +137,17 @@ import {
     RocketOutlined,
     BookOutlined,
     EyeOutlined,
+    FolderOpenOutlined,
     FileTextOutlined,
     SortAscendingOutlined,
     LineChartOutlined
 } from '@ant-design/icons';
 import {useTracker} from 'meteor/react-meteor-data';
 import {Meteor} from 'meteor/meteor';
+import useMethod from '../../hooks/useMethod';
+import CaseStudyPicker from './CaseStudyPicker';
+import StudySelectionModal from '../../components/StudySelectionModal';
+import {resolveVideoTutorial} from '/imports/utils/videoTutorial';
 
 const {Title, Paragraph, Text} = Typography;
 
@@ -153,25 +158,75 @@ export default () => {
     const navigate = useNavigate();
     const user = useTracker(() => Meteor.user(), []);
 
+    // Which example studies this deployment actually has. The list comes from the server because
+    // the mapping lives in Meteor.settings.private (session ids are deployment data), and the
+    // method returns only entries whose share row exists and is usable — so a deployment with no
+    // case studies configured gets an empty list and the controls below render nothing at all,
+    // rather than offering a link that goes nowhere. That is what the two hardcoded
+    // /analysis/visualization/<session id> links this replaced used to do: that route is
+    // ownership-gated, so every visitor who clicked got an access-denied page.
+    const {data: caseStudies, isLoading: caseStudiesLoading} = useMethod('share.caseStudies', undefined, []);
+    const [examplePickerOpen, setExamplePickerOpen] = useState(false);
+    const [studyModalOpen, setStudyModalOpen] = useState(false);
+
+    // How many studies this visitor already has. A server method rather than a subscription:
+    // session.all ships whole Session documents, analyses[] and their per-dataset metadata blobs
+    // included, which is a great deal of traffic to render one integer. It counts through the same
+    // selector the Recent Studies page filters by, so the number here and the rows there agree.
+    const {data: studyCount, isLoading: studyCountLoading} = useMethod('session.myStudyCount', undefined, [user?._id]);
+    const recentStudyCount = studyCount || 0;
+    // Same rule as showExampleControl: visible while the answer is in flight so the hero does not
+    // reflow, gone once we know there is nothing behind it. Guests are auto-created on load, so
+    // "logged out" is not really reachable here; a caller with no user counts zero and hides too.
+    const showRecentStudiesControl = studyCountLoading || recentStudyCount > 0;
+
+    const examples = caseStudies || [];
+    const hasExamples = examples.length > 0;
+    // Render the control while the method is still in flight (disabled) so the hero does not reflow
+    // once it resolves, but drop it entirely once we know there is nothing to offer.
+    const showExampleControl = caseStudiesLoading || hasExamples;
+
+    // The video tutorial demonstrates the previous product and is hidden until a new one is
+    // recorded. The switch is Meteor.settings.public.videoTutorial, DEFAULT OFF: showing it again,
+    // or pointing it at a different video, is a settings edit rather than a code change. Read once
+    // at render — settings do not change under a running client.
+    const videoTutorial = resolveVideoTutorial(Meteor.settings.public);
+
+    // Guests are auto-created asynchronously at startup (imports/client/startup.js), so Meteor.user()
+    // really is null for the first moments of a cold load. The old guard answered an early click
+    // with "Please sign in to try the demo", which is advice no visitor can act on: this app has no
+    // sign-in. The cards below are inert until the account exists, and this is the backstop.
+    const demoReady = Boolean(user);
+    const [creatingDemo, setCreatingDemo] = useState(false);
+
     const handleDemoClick = async (demoType, demoLabel) => {
         if (!user) {
-            notify.error("Please sign in to try the demo");
+            notify.info("Preparing your session — please try again in a moment.");
             return;
         }
+        // A second click before the first navigation lands would create a second identical study.
+        if (creatingDemo) return;
 
+        setCreatingDemo(true);
         try {
+            const demoName = `Demo - ${demoLabel}`;
             const {sessionId, activeAnalysis} = await Meteor.asyncCallWithNotification(
                 "session.create",
                 {
                     userId: user._id,
-                    name: `Demo - ${demoLabel}`,
-                    inputType: demoType
+                    name: demoName,
+                    inputType: demoType,
+                    // The study and its one analysis carry the same name; the analysis name is what
+                    // the tab in the study page shows, and it used to read "Analysis".
+                    analysisName: demoName
                 }
             );
             navigate(`/analysis/session/${sessionId}/${activeAnalysis}?example=${demoType}`);
         } catch (error) {
             console.error('Error creating demo session:', error);
             notify.error("Failed to create demo session");
+        } finally {
+            setCreatingDemo(false);
         }
     };
 
@@ -280,6 +335,31 @@ export default () => {
             .professional-gradient {
                 background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
             }
+
+            /* The two "Get Started in Minutes" cards have identical markup — Row align=middle with
+               an avatar Col, a flex="auto" text Col and a button Col — but the View Example card
+               carries much longer copy. A Col flex="auto" is flex: 1 1 auto, so its hypothetical
+               main size is its MAX-CONTENT width; once the three columns together exceed the card,
+               antd's default wrap breaks the row and the avatar ends up on a line of its own. Both
+               cards were wrapping at desktop width (measured: the View Example card onto three
+               lines, the Tutorial card's button onto a second), so the rule is applied to both
+               rather than to the one that looked worst.
+
+               Both declarations are needed: nowrap keeps the three columns on one line, and
+               min-width:0 lifts the automatic minimum size that would otherwise stop the text
+               column shrinking and make the row overflow instead.
+
+               Scoped to >= 992px, which is exactly where the outer Col xs={24} lg={12} makes the
+               card half width. Below that the card is full width and antd's default wrap applies,
+               because stacking the avatar above the text IS the right answer on a phone. */
+            @media (min-width: 992px) {
+                .quick-start-row {
+                    flex-wrap: nowrap;
+                }
+                .quick-start-text {
+                    min-width: 0;
+                }
+            }
         `}
         </style>
 
@@ -331,11 +411,14 @@ export default () => {
                     comprehensive meta-analysis, consensus analysis, mass analysis and cutting-edge AI-powered insights—all in one integrated platform.
                 </Paragraph>
                 <Space size="large">
-                    <Link to="/analysis/recent-studies">
-                        <Button
+                    {/* Was a second link to /analysis/recent-studies — the same place the counted
+                        button beside it now goes. It asks what to start instead, which is what a
+                        primary call to action on the homepage should do. */}
+                    <Button
                             type="primary"
                             size="large"
                             icon={<RocketOutlined/>}
+                            onClick={() => setStudyModalOpen(true)}
                             style={{
                                 height: '50px',
                                 padding: '0 32px',
@@ -359,12 +442,13 @@ export default () => {
                             }}
                         >
                             Start Your Analysis
-                        </Button>
-                    </Link>
-                    <Link to="/analysis/visualization/CapGyW7w8R4ceTjns">
+                    </Button>
+                    {showExampleControl && (
                         <Button
                             size="large"
                             icon={<EyeOutlined/>}
+                            disabled={!hasExamples}
+                            onClick={() => setExamplePickerOpen(true)}
                             style={{
                                 height: '50px',
                                 padding: '0 32px',
@@ -389,7 +473,43 @@ export default () => {
                         >
                             View Example
                         </Button>
-                    </Link>
+                    )}
+                    {/* Same styling object as View Example beside it, so the hero does not end up
+                        with two buttons that look like they belong to different apps. Prefixed:
+                        urlPrefix is "" in the shipped settings but is interpolated into every route,
+                        so an unprefixed link is a latent bug under a deployment that sets one. */}
+                    {showRecentStudiesControl && (
+                        <Link to={`${window.urlPrefix || ''}/analysis/recent-studies`}>
+                            <Button
+                                size="large"
+                                icon={<FolderOpenOutlined/>}
+                                loading={studyCountLoading}
+                                style={{
+                                    height: '50px',
+                                    padding: '0 32px',
+                                    fontSize: '16px',
+                                    fontWeight: 600,
+                                    borderRadius: '25px',
+                                    background: 'transparent',
+                                    border: '2px solid rgba(255,255,255,0.6)',
+                                    color: 'white',
+                                    backdropFilter: 'blur(5px)'
+                                }}
+                                onMouseEnter={(e) => {
+                                    e.currentTarget.style.background = 'rgba(255,255,255,0.1)';
+                                    e.currentTarget.style.transform = 'translateY(-3px)';
+                                    e.currentTarget.style.boxShadow = '0 6px 20px rgba(0,0,0,0.2)';
+                                }}
+                                onMouseLeave={(e) => {
+                                    e.currentTarget.style.background = 'transparent';
+                                    e.currentTarget.style.transform = 'translateY(0)';
+                                    e.currentTarget.style.boxShadow = 'none';
+                                }}
+                            >
+                                My Recent Studies{recentStudyCount > 0 ? ` (${recentStudyCount})` : ''}
+                            </Button>
+                        </Link>
+                    )}
                 </Space>
                 <Space>
                     <div style={{maxWidth: '1000px', margin: '0 auto', marginTop: '20px'}}>
@@ -611,7 +731,7 @@ export default () => {
                                     icon={<FileTextOutlined style={{fontSize: '36px', color: 'white'}}/>}
                                 />
                                 <Title level={3} style={{color: 'white', marginBottom: '20px', fontSize: '1.8rem'}}>
-                                    AI Interpretation & Insights
+                                    Biological Interpretation & Insights
                                 </Title>
                                 <Paragraph style={{
                                     color: 'rgba(255,255,255,0.9)',
@@ -654,7 +774,7 @@ export default () => {
                                                 e.currentTarget.style.boxShadow = '0 4px 15px rgba(0,0,0,0.2)';
                                             }}
                                         >
-                                            View AI Reports →
+                                            View Reports →
                                         </Button>
                                     </Link>
                                 </div>
@@ -690,7 +810,9 @@ export default () => {
                                     boxShadow: '0 6px 24px rgba(0,0,0,0.1)',
                                     transition: 'all 0.3s ease',
                                     background: 'linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%)',
-                                    cursor: 'pointer'
+                                    // 'progress' until the auto-created guest account has arrived,
+                                    // so the card does not invite a click it would only refuse.
+                                    cursor: demoReady ? (creatingDemo ? 'wait' : 'pointer') : 'progress'
                                 }}
                                 bodyStyle={{
                                     padding: '32px 24px',
@@ -741,7 +863,9 @@ export default () => {
                                     boxShadow: '0 6px 24px rgba(0,0,0,0.1)',
                                     transition: 'all 0.3s ease',
                                     background: 'linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%)',
-                                    cursor: 'pointer'
+                                    // 'progress' until the auto-created guest account has arrived,
+                                    // so the card does not invite a click it would only refuse.
+                                    cursor: demoReady ? (creatingDemo ? 'wait' : 'pointer') : 'progress'
                                 }}
                                 bodyStyle={{
                                     padding: '32px 24px',
@@ -758,7 +882,7 @@ export default () => {
                                     e.currentTarget.style.transform = 'translateY(0)';
                                     e.currentTarget.style.boxShadow = '0 6px 24px rgba(0,0,0,0.1)';
                                 }}
-                                onClick={() => handleDemoClick('pgsea', 'Ranked List Analysis')}
+                                onClick={() => handleDemoClick('pgsea', 'Ranked Gene List with Statistics')}
                             >
                                 <Avatar
                                     size={64}
@@ -770,14 +894,14 @@ export default () => {
                                     icon={<SortAscendingOutlined style={{fontSize: '28px'}}/>}
                                 />
                                 <Title level={4} style={{marginBottom: '12px', color: '#15803d'}}>
-                                    Ranked List Analysis
+                                    Ranked Gene List with Statistics
                                 </Title>
                                 <Paragraph style={{color: '#666', fontSize: '0.95rem', lineHeight: 1.6, flex: 1}}>
-                                    Parametric Gene Set Enrichment Analysis (PGSEA) using ranked genes with statistical scores. Ideal for prioritizing pathways by gene rankings.
+                                    Parametric Gene Set Enrichment Analysis (PGSEA) on a ranked gene list with statistics (gene, log2 fold change, p-value). Ideal for prioritizing pathways from differential-expression results.
                                 </Paragraph>
                                 <div style={{marginTop: '16px'}}>
                                     <Tag color="green">PGSEA Method</Tag>
-                                    <Tag color="lime">Ranked Data</Tag>
+                                    <Tag color="lime">Ranked List with Statistics</Tag>
                                 </div>
                             </Card>
                         </Col>
@@ -792,7 +916,9 @@ export default () => {
                                     boxShadow: '0 6px 24px rgba(0,0,0,0.1)',
                                     transition: 'all 0.3s ease',
                                     background: 'linear-gradient(135deg, #fef3c7 0%, #fde68a 100%)',
-                                    cursor: 'pointer'
+                                    // 'progress' until the auto-created guest account has arrived,
+                                    // so the card does not invite a click it would only refuse.
+                                    cursor: demoReady ? (creatingDemo ? 'wait' : 'pointer') : 'progress'
                                 }}
                                 bodyStyle={{
                                     padding: '32px 24px',
@@ -836,7 +962,11 @@ export default () => {
                 </div>
             </section>
 
-            {/* Video Tutorial Section */}
+            {/* Video Tutorial Section — off unless Meteor.settings.public.videoTutorial.enabled is
+                true AND a youtubeId is set. The shipped video demonstrates the previous product
+                (AIPA); it is hidden rather than deleted so that showing it again, or showing a NEW
+                video, is a settings edit and not a code change. See imports/utils/videoTutorial.js. */}
+            {videoTutorial && (
             <section style={{
                 padding: '60px 24px',
                 background: 'linear-gradient(135deg, #f8faff 0%, #e8f4f8 100%)'
@@ -868,7 +998,7 @@ export default () => {
                         <iframe
                             width="100%"
                             height="450"
-                            src="https://www.youtube.com/embed/LF7ryDqFVDc"
+                            src={videoTutorial.embedUrl}
                             title="IPSA Tutorial Video"
                             frameBorder="0"
                             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
@@ -878,11 +1008,17 @@ export default () => {
                     </div>
                 </div>
             </section>
+            )}
 
             {/* Quick Start Section */}
             <section style={{padding: '60px 24px', background: 'white'}}>
                 <div style={{maxWidth: '1200px', margin: '0 auto'}}>
-                    <Row gutter={[40, 40]} align="middle">
+                    {/* align="stretch", not the default: align="middle" centred the gradient box at
+                        its own content height, leaving it floating in the middle of a taller left
+                        column. Dropping the prop is NOT equivalent — antd's default is "top", which
+                        would top-align rather than stretch. The box also needs height:100% below,
+                        because the Col stretches but its child still sizes to its own content. */}
+                    <Row gutter={[40, 40]} align="stretch">
                         <Col xs={24} lg={12}>
                             <Title level={2} style={{marginBottom: '24px', color: '#105062'}}>
                                 Get Started in Minutes
@@ -895,33 +1031,44 @@ export default () => {
                             </Paragraph>
 
                             <Space direction="vertical" size="large" style={{width: '100%'}}>
-                                <Card style={{borderRadius: '12px', border: '1px solid #e8e8e8'}}>
-                                    <Row align="middle" gutter={16}>
-                                        <Col flex="none">
-                                            <Avatar size={48} style={{background: '#52c41a'}} icon={<EyeOutlined/>}/>
-                                        </Col>
-                                        <Col flex="auto">
-                                            <Title level={5} style={{margin: 0, marginBottom: '4px', color: '#105062'}}>View
-                                                Example
-                                                Analysis</Title>
-                                            <Paragraph style={{margin: 0, color: '#666'}}>
-                                                Explore a complete analysis session with visualizations and AI insights
-                                            </Paragraph>
-                                        </Col>
-                                        <Col flex="none">
-                                            <Link to="/analysis/visualization/CapGyW7w8R4ceTjns">
-                                                <Button type="link" style={{color: '#1a6c7a'}}>Explore →</Button>
-                                            </Link>
-                                        </Col>
-                                    </Row>
-                                </Card>
+                                {showExampleControl && (
+                                    <Card style={{borderRadius: '12px', border: '1px solid #e8e8e8'}}>
+                                        {/* quick-start-row / quick-start-text: see the @media rule
+                                            in the <style> block above. Both cards carry them so the
+                                            two cannot drift apart as their copy changes. */}
+                                        <Row align="middle" gutter={16} className="quick-start-row">
+                                            <Col flex="none">
+                                                <Avatar size={48} style={{background: '#52c41a'}} icon={<EyeOutlined/>}/>
+                                            </Col>
+                                            <Col flex="auto" className="quick-start-text">
+                                                <Title level={5} style={{margin: 0, marginBottom: '4px', color: '#105062'}}>View
+                                                    Example
+                                                    Analysis</Title>
+                                                <Paragraph style={{margin: 0, color: '#666'}}>
+                                                    Get your own copy of a complete study — visualizations, biological insights
+                                                    and the input data, ready to re-run
+                                                </Paragraph>
+                                            </Col>
+                                            <Col flex="none">
+                                                <Button
+                                                    type="link"
+                                                    style={{color: '#1a6c7a'}}
+                                                    disabled={!hasExamples}
+                                                    onClick={() => setExamplePickerOpen(true)}
+                                                >
+                                                    Explore →
+                                                </Button>
+                                            </Col>
+                                        </Row>
+                                    </Card>
+                                )}
 
                                 <Card style={{borderRadius: '12px', border: '1px solid #e8e8e8'}}>
-                                    <Row align="middle" gutter={16}>
+                                    <Row align="middle" gutter={16} className="quick-start-row">
                                         <Col flex="none">
                                             <Avatar size={48} style={{background: '#1890ff'}} icon={<BookOutlined/>}/>
                                         </Col>
-                                        <Col flex="auto">
+                                        <Col flex="auto" className="quick-start-text">
                                             <Title level={5} style={{margin: 0, marginBottom: '4px', color: '#105062'}}>Interactive
                                                 Tutorial</Title>
                                             <Paragraph style={{margin: 0, color: '#666'}}>
@@ -939,13 +1086,20 @@ export default () => {
                         </Col>
 
                         <Col xs={24} lg={12}>
+                            {/* height:100% fills the column the Row now stretches (see align above);
+                                the flex column then keeps the heading, text and button optically
+                                centred instead of stacking them at the top of a taller box. */}
                             <div style={{
                                 background: 'linear-gradient(135deg, #105062 0%, #1a6c7a 100%)',
                                 borderRadius: '20px',
                                 padding: '48px 40px',
                                 textAlign: 'center',
                                 color: 'white',
-                                boxShadow: '0 12px 40px rgba(16, 80, 98, 0.3)'
+                                boxShadow: '0 12px 40px rgba(16, 80, 98, 0.3)',
+                                height: '100%',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                justifyContent: 'center'
                             }}>
                                 <Title level={3} style={{color: 'white', marginBottom: '24px'}}>
                                     Ready to Analyze Your Data?
@@ -959,32 +1113,52 @@ export default () => {
                                     Join thousands of researchers who trust IPSA for their
                                     pathway analysis and data visualization needs.
                                 </Paragraph>
-                                <Link to="/analysis/recent-studies">
-                                    <Button
-                                        type="primary"
-                                        size="large"
-                                        icon={<RocketOutlined/>}
-                                        style={{
-                                            height: '50px',
-                                            padding: '0 32px',
-                                            fontSize: '16px',
-                                            fontWeight: 600,
-                                            borderRadius: '25px',
-                                            background: 'white',
-                                            color: '#105062',
-                                            border: 'none',
-                                            boxShadow: '0 4px 15px rgba(0,0,0,0.2)'
-                                        }}
-                                    >
-                                        Start Your Analysis
-                                    </Button>
-                                </Link>
+                                {/* PR #187 changed the hero's "Start Your Analysis" to open the
+                                    study modal; this one was left pointing at the stale destination
+                                    the hero used to have, so two buttons with the same label did
+                                    two different things. It opens the SAME modal instance mounted
+                                    at the bottom of this file — the page already owns the state. */}
+                                <Button
+                                    type="primary"
+                                    size="large"
+                                    icon={<RocketOutlined/>}
+                                    onClick={() => setStudyModalOpen(true)}
+                                    style={{
+                                        height: '50px',
+                                        padding: '0 32px',
+                                        fontSize: '16px',
+                                        fontWeight: 600,
+                                        borderRadius: '25px',
+                                        background: 'white',
+                                        color: '#105062',
+                                        border: 'none',
+                                        boxShadow: '0 4px 15px rgba(0,0,0,0.2)'
+                                    }}
+                                >
+                                    Start Your Analysis
+                                </Button>
                             </div>
                         </Col>
                     </Row>
                 </div>
             </section>
         </div>
+
+        {/* One modal for both "View Example" controls above — the hero button and the Quick Start
+            card open the same picker rather than each owning a copy of it. */}
+        <CaseStudyPicker
+            open={examplePickerOpen}
+            onClose={() => setExamplePickerOpen(false)}
+            caseStudies={examples}
+        />
+        {/* Mounted here for the same reason the picker above is: the hero owns the control that
+            opens it. mode="choose" asks single vs mass, which the header's two menu entries answer
+            up front and the homepage's single button cannot. */}
+        <StudySelectionModal
+            visible={studyModalOpen}
+            onClose={() => setStudyModalOpen(false)}
+            mode="choose"
+        />
     </div>
     );
 };

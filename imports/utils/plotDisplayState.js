@@ -55,9 +55,50 @@ export const computePlotDisplayState = ({
     return 'ready';
 };
 
+/**
+ * The same loading-vs-no-data decision for the panes whose data comes from plain fetches:
+ * KEGGMap, ForestChartTable and NegBarChartTable.
+ *
+ * Deliberately thin. Those three panes look near-identical but their "do we have data?" tests are
+ * NOT the same — ForestChartTable additionally requires `initialTreeData`, NegBarChartTable does
+ * not, and KEGGMap tests a selected-pathway list — and that divergence is long-standing (the
+ * commented-out predecessors of both render guards show it too). A fatter helper taking each pane's
+ * raw state would have to carry a flag meaning "this one is stricter", which hides the difference
+ * rather than expressing it. So each caller computes its own `hasData` and this function owns only
+ * the part that is genuinely common, and genuinely subtle:
+ *
+ *   - `loading` outranks everything, so no "no data" verdict can fire mid-flight;
+ *   - a fetch that FAILED but still left us with data renders the data — a transient failure must
+ *     not blank a pane that has something to show;
+ *   - a fetch that failed and left us with nothing says so, instead of claiming there are no
+ *     significant pathways. Those are different facts, and reporting the second for the first is
+ *     the false negative this helper exists to stop: the user cannot tell a real empty result from
+ *     a dropped request, so the bug hides.
+ *
+ * @param {Object} params
+ * @param {boolean} params.loading  any fetch this pane depends on is still in flight
+ * @param {boolean} params.failed   any of those fetches failed or returned nothing usable
+ * @param {boolean} params.hasData  the caller's own "there is something to render" predicate
+ * @returns {'loading'|'ready'|'load-failed'|'no-pathways'}
+ */
+export const computeFetchedPlotState = ({
+    loading = false,
+    failed = false,
+    hasData = false,
+} = {}) => {
+    if (loading) return 'loading';
+    if (hasData) return 'ready';
+    if (failed) return 'load-failed';
+    return 'no-pathways';
+};
+
 /** Human-readable message for each non-'ready', non-'loading' state. */
 export const PLOT_STATE_MESSAGES = {
     'no-de-genes': 'No significant differentially expressed genes were identified.',
     'no-result': 'No result found for this method.',
     'no-pathways': 'No significant pathways were identified',
+    // Distinct from 'no-pathways' on purpose. These panes previously swallowed every fetch error
+    // and rendered the "no pathways" copy, so a dropped request was indistinguishable from a real
+    // empty result — which is why the KEGG false negative went unreported for so long.
+    'load-failed': 'Could not load pathway results. Reload the page to try again.',
 };

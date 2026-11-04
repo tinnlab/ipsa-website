@@ -1,6 +1,6 @@
 // InsightComponents.jsx - Components for viewing and managing insights
 
-import React, {useState, useEffect, useMemo} from 'react';
+import React, {useState, useEffect, useMemo, useRef} from 'react';
 import {
     Table,
     Checkbox,
@@ -37,6 +37,8 @@ import {
 } from '@ant-design/icons';
 import { firstPanelKeys, insightItemModel, reportHeaderModel } from '/imports/utils/insightListModel';
 import { capTags, moreTagLabel } from '/imports/utils/tagDisplay';
+import { templateAnchorId, exportMarkdownForTemplates, templatesTocStructure } from '/imports/utils/reportTemplates';
+import { resolveAnalysisName } from '/imports/utils/metaAnalysisGeneLevel';
 import { formatInterpretationContext } from '/imports/utils/interpretationContext';
 import moment from 'moment';
 import {
@@ -46,9 +48,7 @@ import {
     MarkdownWithReferences,
     getDatabaseMapping,
     buildPathwayMethodsData,
-    getVirtualTableProps,
-    extractMarkdownHeadings,
-    buildTOCHierarchy
+    getVirtualTableProps
 } from './utils';
 import { exportToPDF, exportToWord } from '/imports/utils/reportExport';
 import MarkdownTableOfContents from './MarkdownTableOfContents';
@@ -57,8 +57,16 @@ import AnalysisUtils from '/imports/client/pages/home/Analysis/Session/component
 import {formatNumberForExport} from '/imports/utils/exportUtils';
 import {authHeaders} from '/imports/client/utils/authHeaders';
 import {useGlobalSettings} from '/imports/client/contexts/GlobalSettingsContext';
+import {loadMetaPathwayTables} from '/imports/client/utils/metaPathwayData';
+import {findReportMetaAnalysis} from '/imports/utils/metaPathwayInfo';
 
 const {Title, Text} = Typography;
+
+// Height of the app chrome above this page. The report toolbar and the AI-interpretation page's
+// own side rail both already stick at this offset; naming it keeps the three in step.
+const APP_HEADER_HEIGHT = 70;
+// Breathing room between the stuck toolbar and the top of the rail.
+const TOC_GAP = 16;
 
 // Shared presentational list of insight/report items. Used by BOTH the default
 // AI-interpretation page and the per-analysis InsightDashboard so the two views
@@ -151,6 +159,11 @@ const processTemplateResult = async (prompt) => {
                 templateId: prompt.templateId,
                 title: prompt.templateTitle,
                 content: processedResult,
+                // The publication-ready workflow stores quality score, validation status and its
+                // pathway/gene counts here (queue.createWorkflowBatch). Dropping it is why the
+                // metadata panel below has never once rendered: its guard reads a key this function
+                // did not produce.
+                metadata: prompt.result?.metadata || null,
                 references: [],
                 referenceMapping: new Map(),
                 orderedIds: []
@@ -219,6 +232,7 @@ const processTemplateResult = async (prompt) => {
             templateId: prompt.templateId,
             title: prompt.templateTitle,
             content: contentWithNumbers,
+            metadata: prompt.result?.metadata || null,
             references: validReferences,
             referenceMapping: mapping,
             orderedIds
@@ -239,6 +253,7 @@ const processTemplateResult = async (prompt) => {
             templateId: prompt.templateId,
             title: prompt.templateTitle,
             content: prompt.result?.answer || '',
+            metadata: prompt.result?.metadata || null,
             references: [],
             referenceMapping: new Map(),
             orderedIds: []
@@ -265,8 +280,37 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
     const [geneNameFilter, setGeneNameFilter] = useState('');
     const [pathwayNameFilter, setPathwayNameFilter] = useState('');
     const [processedTemplates, setProcessedTemplates] = useState([]);
-    const [activeTemplateKey, setActiveTemplateKey] = useState('');
     const [activeReferenceId, setActiveReferenceId] = useState(null);
+
+    // The report toolbar is sticky at APP_HEADER_HEIGHT, so while scrolling it occupies the band
+    // from there to its own height. The table-of-contents rail is sticky too and used to stop at
+    // 20px, which put it underneath both the app header and this toolbar. Measure the toolbar
+    // instead of hardcoding a clearance: its height moves with the title's wrapping and with
+    // whether a breadcrumb trail is present, so any constant would drift out of date.
+    const [toolbarHeight, setToolbarHeight] = useState(0);
+    const toolbarRef = useRef(null);
+
+    useEffect(() => {
+        const el = toolbarRef.current;
+        if (!el) return;
+
+        // getBoundingClientRect is the border-box height, so the toolbar's padding and bottom
+        // border are already in it -- no padding constant to keep in sync with the styles.
+        const measure = () => setToolbarHeight(el.getBoundingClientRect().height);
+        measure();
+
+        if (typeof ResizeObserver === 'undefined') return;
+        const observer = new ResizeObserver(measure);
+        observer.observe(el);
+        return () => observer.disconnect();
+        // Keyed on `loading`, not []: the toolbar is behind the loading early-return above, so on
+        // first mount the ref is still null. Without this the rail would keep its initial offset
+        // and stay tucked under the toolbar for the whole session.
+    }, [loading]);
+
+    // Before the first measurement toolbarHeight is 0, which still clears the app header, so the
+    // rail never starts out underneath it.
+    const tocOffsetTop = APP_HEADER_HEIGHT + toolbarHeight + TOC_GAP;
 
     useEffect(() => {
         const fetchInsight = async () => {
@@ -285,12 +329,6 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
                     );
 
                     setProcessedTemplates(processed);
-
-                    // Set the first template as active by default - convert to string
-                    if (processed.length > 0) {
-                        const firstTemplateKey = processed[0].id.toString();
-                        setActiveTemplateKey(firstTemplateKey);
-                    }
                 }
             } catch (error) {
                 console.error('Error fetching insight:', error);
@@ -351,6 +389,34 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
                     const sessionConfigs = await Meteor.callAsync('visualization.getConfigurations', {sessionId: batch.sessionId});
                     const config = Object.entries(sessionConfigs.allConfigs).filter(([id, value]) => id === batch.analysisId).map(([id, value]) => value)[0];
                     const analysis = sessionConfigs.analyses.filter(e => e.id === batch.analysisId)[0];
+
+                    // A meta-analysis report stores the META id as its analysisId, and
+                    // getConfigurations lists only the session's ordinary analyses, so `analysis`
+                    // and `config` are undefined here. The single-analysis code below then threw
+                    // on `analysis.input`, the catch only logged it, and the modal's Pathways and
+                    // Statistical Methods cards stayed empty. Load the meta results instead, with
+                    // the same loader the wizard used to build this report's selection.
+                    if (!analysis) {
+                        const metaAnalyses = await Meteor.callAsync('visualization.getMetaAnalyses', {sessionId: batch.sessionId});
+                        const metaAnalysis = findReportMetaAnalysis(batch.analysisId, sessionConfigs.analyses, metaAnalyses);
+                        if (metaAnalysis) {
+                            const dbMapping = await getDatabaseMapping();
+                            const dbIdToNameMapping = Object.entries(dbMapping).reduce((acc, [name, id]) => {
+                                acc[id] = name;
+                                return acc;
+                            }, {});
+                            const tables = await loadMetaPathwayTables({
+                                sessionId: batch.sessionId,
+                                analysisId: batch.analysisId,
+                                dbIdToNameMapping,
+                            });
+                            if (methodOrder.length === 0) {
+                                setMethodOrder([metaAnalysis.pathwayLevel?.method?.toUpperCase() || 'META']);
+                            }
+                            setPathwayData(tables || []);
+                            return;
+                        }
+                    }
 
                     const response = await Meteor.callAsync('analysis.results.aggregate', {
                         analysisId: batch.analysisId,
@@ -504,10 +570,11 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
             return;
         }
 
-        // Export the report that is actually on screen: the collapse panel the user has open,
-        // falling back to the first template (which is the final report in workflow mode).
-        const activeTemplate = processedTemplates.find(t => t.id.toString() === activeTemplateKey);
-        const reportContent = (activeTemplate || processedTemplates[0])?.content;
+        // Everything on screen, in the order it is rendered. There is no "active" template any
+        // more — the accordion that produced one is gone — and exporting the first of six visible
+        // sections would silently drop five. A single-template report still exports exactly its own
+        // content, so the publication-ready case is unchanged down to the byte.
+        const reportContent = exportMarkdownForTemplates(processedTemplates);
         if (!reportContent) {
             message.error('Report content is empty');
             return;
@@ -554,18 +621,6 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
             onClick: () => handleExport('word')
         }
     ];
-
-    const handleCollapseChange = (activeKeys) => {
-        console.log('Collapse change - activeKeys:', activeKeys);
-        if (activeKeys.length > 0) {
-            console.log('Setting activeTemplateKey to:', activeKeys[0]);
-            setActiveTemplateKey(activeKeys[0]);
-            setActiveReferenceId(null); // Reset active reference when switching templates
-        } else {
-            console.log('No active keys, clearing activeTemplateKey');
-            setActiveTemplateKey('');
-        }
-    };
 
     const deGenesDataMemo = useMemo(() => {
         if (geneNameFilter !== '') {
@@ -823,19 +878,12 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
         }))
     }
 
-    // Extract TOC from the active template's markdown content (must be before early returns)
-    const tocStructure = useMemo(() => {
-        if (loading || !processedTemplates || processedTemplates.length === 0) return [];
-
-        // Get the active template (currently opened in collapse)
-        const activeTemplate = processedTemplates.find(t => t.id.toString() === activeTemplateKey);
-        if (!activeTemplate || !activeTemplate.content) return [];
-
-        // Extract headings and filter to only level 1 and 2
-        const headings = extractMarkdownHeadings(activeTemplate.content);
-        const filteredHeadings = headings.filter(h => h.level === 1 || h.level === 2);
-        return buildTOCHierarchy(filteredHeadings);
-    }, [processedTemplates, activeTemplateKey, loading]);
+    // The TOC of the whole report body, not of one accordion panel — see templatesTocStructure.
+    // (Must stay above the early returns: it is a hook.)
+    const tocStructure = useMemo(
+        () => (loading ? [] : templatesTocStructure(processedTemplates)),
+        [processedTemplates, loading]
+    );
 
     // Which report this is, and where it sits. Same title the list item shows — one definition, so
     // the two can never disagree. Computed before the loading return so the user can see WHICH
@@ -857,37 +905,6 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
         );
     }
 
-    const collapseItems = processedTemplates.map(template => {
-        console.log('Creating collapse item for template:', {
-            id: template.id,
-            title: template.title,
-            contentLength: template.content?.length || 0,
-            referencesCount: template.references?.length || 0,
-            hasReferences: template.references && template.references.length > 0,
-        });
-
-        return {
-            key: template.id.toString(), // Convert ObjectID to string
-            label: (
-                <span>
-                {template.title}
-                    {template.references && template.references.length > 0 && (
-                        <span style={{marginLeft: '8px', fontSize: '12px', color: '#666'}}>
-                        ({template.references.length} refs)
-                    </span>
-                    )}
-            </span>
-            ),
-            children: (
-                <MarkdownWithReferences
-                    content={template.content}
-                    references={template.references}
-                    referenceMapping={template.referenceMapping}
-                    onReferenceClick={handleReferenceClick}
-                />
-            )
-        };
-    });
 
     return (
         <div style={{padding: '24px'}}>
@@ -897,9 +914,10 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
                 pulled out to the container's edges by the negative margin so nothing scrolls
                 through beside it. top clears the app header, matching the page's own side rail. */}
             <div
+                ref={toolbarRef}
                 style={{
                     position: 'sticky',
-                    top: 70,
+                    top: APP_HEADER_HEIGHT,
                     zIndex: 10,
                     background: '#fff',
                     margin: '-24px -24px 16px',
@@ -1018,6 +1036,11 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
                     <Card title={"Pathways"}>
                         {(() => {
                             const pathwayItems = getPathwayCollapseItems();
+                            // An empty Collapse renders as a blank card, which read as "no
+                            // pathways were selected" when the results had simply not loaded.
+                            if (pathwayItems.length === 0) {
+                                return <Empty description="No pathway results available"/>;
+                            }
                             return (
                                 <Collapse
                                     defaultActiveKey={firstPanelKeys(pathwayItems)}
@@ -1048,7 +1071,7 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
                         breakpoint="lg"
                         collapsedWidth="0"
                     >
-                        <MarkdownTableOfContents headings={tocStructure} />
+                        <MarkdownTableOfContents headings={tocStructure} offsetTop={tocOffsetTop} />
                     </Layout.Sider>
                 )}
                 <Layout.Content style={{padding: '0 24px', minHeight: '100vh'}}>
@@ -1064,42 +1087,55 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
                                 overflowY: 'auto',
                                 padding: '20px'
                             }}>
-                                <Card className="shadow-sm">
-                                    {/* The report's name lives in the persistent header above,
+                                <div>
+                                    {/* No Card around the body. The report IS this page's content,
+                                        not a widget sitting on it, and a bordered, shadowed panel
+                                        inside a padded column inside a Layout.Content narrowed the
+                                        prose for nothing gained.
+                                        The report's name lives in the persistent header above,
                                         not here. It used to be rendered at this spot, inside the
                                         scrolling container — and from `insight?.insightName`,
                                         which is always undefined: queue.getBatchStatus answers
                                         {batch, prompts}, so the name is one level down. Every
                                         report was therefore titled "Analysis Insight". */}
-                            {batch?.workflowType === 'publication-ready' && processedTemplates.length > 0 && processedTemplates[0]?.result?.metadata && (
-                                <Card
-                                    size="small"
-                                    style={{marginBottom: '24px', backgroundColor: '#f0f5ff', borderColor: '#adc6ff'}}
-                                    title={
-                                        <Space>
-                                            <Tag color="blue">📋 Complete Publication-Ready Workflow (13 Steps)</Tag>
-                                            <Text type="secondary">Comprehensive analysis with fact-checking</Text>
-                                        </Space>
-                                    }
+                            {/* `?.metadata`, not `?.result?.metadata`. processTemplateResult has never
+                                returned a `result` key, so this guard was always undefined and this
+                                whole panel has never rendered once — even though the workflow does
+                                store the metadata (queue.createWorkflowBatch). Reading the key that
+                                exists is what makes it appear. A bordered div rather than a Card:
+                                the information is worth keeping, the nested-card chrome is not. */}
+                            {batch?.workflowType === 'publication-ready' && processedTemplates.length > 0 && processedTemplates[0]?.metadata && (
+                                <div
+                                    style={{
+                                        marginBottom: '24px',
+                                        padding: '12px 16px',
+                                        backgroundColor: '#f0f5ff',
+                                        border: '1px solid #adc6ff',
+                                        borderRadius: '8px'
+                                    }}
                                 >
+                                    <Space style={{marginBottom: 12}}>
+                                        <Tag color="blue">Interpretation Report</Tag>
+                                        <Text type="secondary">Automated pathway and gene interpretation</Text>
+                                    </Space>
                                     <Space direction="vertical" style={{width: '100%', gap: 12}}>
                                         <div>
                                             <Text strong style={{display: 'block', marginBottom: 8}}>Quality & Validation:</Text>
                                             <Space wrap>
                                                 <Text strong>Quality Score:</Text>
-                                                <Tag color="cyan">{processedTemplates[0].result.metadata.qualityScore || 'N/A'}/10</Tag>
-                                                {processedTemplates[0].result.metadata.validationStatus && (
+                                                <Tag color="cyan">{processedTemplates[0].metadata.qualityScore || 'N/A'}/10</Tag>
+                                                {processedTemplates[0].metadata.validationStatus && (
                                                     <>
                                                         <Text strong>Validation:</Text>
-                                                        <Tag color={processedTemplates[0].result.metadata.validationStatus === 'validated' ? 'green' : 'orange'}>
-                                                            {processedTemplates[0].result.metadata.validationStatus}
+                                                        <Tag color={processedTemplates[0].metadata.validationStatus === 'validated' ? 'green' : 'orange'}>
+                                                            {processedTemplates[0].metadata.validationStatus}
                                                         </Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.biologicalPlausibility && (
+                                                {processedTemplates[0].metadata.biologicalPlausibility && (
                                                     <>
                                                         <Text strong>Plausibility:</Text>
-                                                        <Tag>{processedTemplates[0].result.metadata.biologicalPlausibility}</Tag>
+                                                        <Tag>{processedTemplates[0].metadata.biologicalPlausibility}</Tag>
                                                     </>
                                                 )}
                                             </Space>
@@ -1108,34 +1144,34 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
                                         <div>
                                             <Text strong style={{display: 'block', marginBottom: 8}}>Pathway Analysis:</Text>
                                             <Space wrap>
-                                                {processedTemplates[0].result.metadata.themesCount > 0 && (
+                                                {processedTemplates[0].metadata.themesCount > 0 && (
                                                     <>
                                                         <Text strong>Themes:</Text>
-                                                        <Tag>{processedTemplates[0].result.metadata.themesCount}</Tag>
+                                                        <Tag>{processedTemplates[0].metadata.themesCount}</Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.criticalPathwaysCount > 0 && (
+                                                {processedTemplates[0].metadata.criticalPathwaysCount > 0 && (
                                                     <>
                                                         <Text strong>Critical Pathways:</Text>
-                                                        <Tag color="red">{processedTemplates[0].result.metadata.criticalPathwaysCount}</Tag>
+                                                        <Tag color="red">{processedTemplates[0].metadata.criticalPathwaysCount}</Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.novelPathwaysCount > 0 && (
+                                                {processedTemplates[0].metadata.novelPathwaysCount > 0 && (
                                                     <>
                                                         <Text strong>Novel:</Text>
-                                                        <Tag color="purple">{processedTemplates[0].result.metadata.novelPathwaysCount}</Tag>
+                                                        <Tag color="purple">{processedTemplates[0].metadata.novelPathwaysCount}</Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.activatedPathwaysCount > 0 && (
+                                                {processedTemplates[0].metadata.activatedPathwaysCount > 0 && (
                                                     <>
                                                         <Text strong>Activated:</Text>
-                                                        <Tag color="green">{processedTemplates[0].result.metadata.activatedPathwaysCount}</Tag>
+                                                        <Tag color="green">{processedTemplates[0].metadata.activatedPathwaysCount}</Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.suppressedPathwaysCount > 0 && (
+                                                {processedTemplates[0].metadata.suppressedPathwaysCount > 0 && (
                                                     <>
                                                         <Text strong>Suppressed:</Text>
-                                                        <Tag color="orange">{processedTemplates[0].result.metadata.suppressedPathwaysCount}</Tag>
+                                                        <Tag color="orange">{processedTemplates[0].metadata.suppressedPathwaysCount}</Tag>
                                                     </>
                                                 )}
                                             </Space>
@@ -1144,22 +1180,22 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
                                         <div>
                                             <Text strong style={{display: 'block', marginBottom: 8}}>Gene-Level Insights:</Text>
                                             <Space wrap>
-                                                {processedTemplates[0].result.metadata.hubGenesCount > 0 && (
+                                                {processedTemplates[0].metadata.hubGenesCount > 0 && (
                                                     <>
                                                         <Text strong>Hub Genes:</Text>
-                                                        <Tag color="volcano">{processedTemplates[0].result.metadata.hubGenesCount}</Tag>
+                                                        <Tag color="volcano">{processedTemplates[0].metadata.hubGenesCount}</Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.masterRegulatorsCount > 0 && (
+                                                {processedTemplates[0].metadata.masterRegulatorsCount > 0 && (
                                                     <>
                                                         <Text strong>Master Regulators:</Text>
-                                                        <Tag color="magenta">{processedTemplates[0].result.metadata.masterRegulatorsCount}</Tag>
+                                                        <Tag color="magenta">{processedTemplates[0].metadata.masterRegulatorsCount}</Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.pathwayInteractionsCount > 0 && (
+                                                {processedTemplates[0].metadata.pathwayInteractionsCount > 0 && (
                                                     <>
                                                         <Text strong>Interactions:</Text>
-                                                        <Tag>{processedTemplates[0].result.metadata.pathwayInteractionsCount}</Tag>
+                                                        <Tag>{processedTemplates[0].metadata.pathwayInteractionsCount}</Tag>
                                                     </>
                                                 )}
                                             </Space>
@@ -1168,28 +1204,28 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
                                         <div>
                                             <Text strong style={{display: 'block', marginBottom: 8}}>Hypotheses & Therapeutic:</Text>
                                             <Space wrap>
-                                                {processedTemplates[0].result.metadata.hypothesesCount > 0 && (
+                                                {processedTemplates[0].metadata.hypothesesCount > 0 && (
                                                     <>
                                                         <Text strong>Hypotheses:</Text>
-                                                        <Tag color="geekblue">{processedTemplates[0].result.metadata.hypothesesCount}</Tag>
+                                                        <Tag color="geekblue">{processedTemplates[0].metadata.hypothesesCount}</Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.drugTargetsCount > 0 && (
+                                                {processedTemplates[0].metadata.drugTargetsCount > 0 && (
                                                     <>
                                                         <Text strong>Drug Targets:</Text>
-                                                        <Tag color="gold">{processedTemplates[0].result.metadata.drugTargetsCount}</Tag>
+                                                        <Tag color="gold">{processedTemplates[0].metadata.drugTargetsCount}</Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.repurposingOpportunitiesCount > 0 && (
+                                                {processedTemplates[0].metadata.repurposingOpportunitiesCount > 0 && (
                                                     <>
                                                         <Text strong>Repurposing:</Text>
-                                                        <Tag color="lime">{processedTemplates[0].result.metadata.repurposingOpportunitiesCount}</Tag>
+                                                        <Tag color="lime">{processedTemplates[0].metadata.repurposingOpportunitiesCount}</Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.validationExperimentsCount > 0 && (
+                                                {processedTemplates[0].metadata.validationExperimentsCount > 0 && (
                                                     <>
                                                         <Text strong>Experiments:</Text>
-                                                        <Tag>{processedTemplates[0].result.metadata.validationExperimentsCount}</Tag>
+                                                        <Tag>{processedTemplates[0].metadata.validationExperimentsCount}</Tag>
                                                     </>
                                                 )}
                                             </Space>
@@ -1198,35 +1234,81 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
                                         <div>
                                             <Text strong style={{display: 'block', marginBottom: 8}}>Literature & References:</Text>
                                             <Space wrap>
-                                                {processedTemplates[0].result.metadata.claimsVerified !== undefined && (
+                                                {processedTemplates[0].metadata.claimsVerified !== undefined && (
                                                     <>
                                                         <Text strong>Verified Claims:</Text>
-                                                        <Tag color="green">{processedTemplates[0].result.metadata.claimsVerified}</Tag>
+                                                        <Tag color="green">{processedTemplates[0].metadata.claimsVerified}</Tag>
                                                     </>
                                                 )}
-                                                {processedTemplates[0].result.metadata.referencesCount > 0 && (
+                                                {processedTemplates[0].metadata.referencesCount > 0 && (
                                                     <>
                                                         <Text strong>PubMed References:</Text>
-                                                        <Tag color="blue">{processedTemplates[0].result.metadata.referencesCount} citations</Tag>
+                                                        <Tag color="blue">{processedTemplates[0].metadata.referencesCount} citations</Tag>
                                                     </>
                                                 )}
                                             </Space>
                                         </div>
                                     </Space>
-                                </Card>
+                                </div>
                             )}
 
+                            {/* Every template, in order, already open. The accordion made the report
+                                something you had to click before you could read it, and — being an
+                                accordion — showed at most one of the six sections a legacy batch
+                                carries. A section heading is rendered ONLY when there is more than
+                                one template: it separates the sections and is the anchor the
+                                contents list targets (templatesTocStructure injects a top-level
+                                entry per template, and nothing at all for a lone one). A
+                                single-template report is the whole page, so labelling it with its
+                                own title — "Publication-Ready Report with Fact-Checking" — told the
+                                reader nothing they could not see, which is why it is gone. */}
                             {processedTemplates.length > 0 ? (
-                                <Collapse
-                                    activeKey={activeTemplateKey ? [activeTemplateKey.toString()] : []}
-                                    onChange={handleCollapseChange}
-                                    items={collapseItems}
-                                    accordion
-                                />
+                                processedTemplates.map((template, index) => (
+                                    <section
+                                        key={String(template.id)}
+                                        style={{marginBottom: index === processedTemplates.length - 1 ? 0 : 40}}
+                                    >
+                                        {processedTemplates.length > 1 && (
+                                            <div
+                                                id={templateAnchorId(template)}
+                                                style={{
+                                                    // Clears the sticky header above, exactly as the
+                                                    // rendered markdown headings do.
+                                                    scrollMarginTop: 100,
+                                                    marginBottom: 16,
+                                                    paddingBottom: 8,
+                                                    borderBottom: '1px solid #f0f0f0'
+                                                }}
+                                            >
+                                                <Title level={4} style={{margin: 0}}>{template.title}</Title>
+                                                {template.references && template.references.length > 0 && (
+                                                    <Text type="secondary" style={{fontSize: 12}}>
+                                                        {template.references.length} refs
+                                                    </Text>
+                                                )}
+                                            </div>
+                                        )}
+                                        <MarkdownWithReferences
+                                            content={template.content}
+                                            references={template.references}
+                                            referenceMapping={template.referenceMapping}
+                                            onReferenceClick={handleReferenceClick}
+                                            // Same prefix templatesTocStructure uses, so the
+                                            // contents list and the headings it scrolls to agree.
+                                            idPrefix={templateAnchorId(template)}
+                                        />
+                                    </section>
+                                ))
                             ) : (
-                                <Empty description="No completed templates available"/>
+                                // Reached when the fetch failed too — queue.getBatchStatus's error is
+                                // swallowed and loading simply clears — so this has to say something
+                                // a reader can act on.
+                                <Empty
+                                    image={Empty.PRESENTED_IMAGE_SIMPLE}
+                                    description="No finished sections in this report yet. Generation may still be running, or every prompt in it may have failed."
+                                />
                             )}
-                                </Card>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1236,7 +1318,12 @@ export const InsightViewer = ({batchId, onClose, setView, setSelectedInsight, st
     );
 };
 
-export const InsightDashboard = ({userId, sessionId, onViewInsight}) => {
+// `analyses` / `metaAnalyses` are optional and used only to re-resolve the group heading. The name
+// on a BatchInfo row is denormalized at generation time, so every report saved before meta-analysis
+// ids resolved carries "Analysis <id>" in the database. Resolving live here fixes those rows on
+// screen — and keeps the heading right after an analysis is renamed — with no migration and no
+// change to stored data. The stored name stays the fallback for a study we cannot consult.
+export const InsightDashboard = ({userId, sessionId, onViewInsight, analyses, metaAnalyses}) => {
     // True for a view-only imported study; supplied by the Visualization page's provider.
     const {readOnly} = useGlobalSettings();
     const [batchesData, setBatchesData] = useState([]);
@@ -1384,7 +1471,12 @@ export const InsightDashboard = ({userId, sessionId, onViewInsight}) => {
         <div className="space-y-6">
             {batchesData.map(({analysisId, analysisName, batches}) => (
                 <Card key={analysisId} className="shadow-sm">
-                    <Title level={4}>{analysisName}</Title>
+                    {/* Resolved at render, not at fetch: the study data arrives independently of
+                        the 5s batch poll, and keeping it out of the effect means the poller's
+                        deps stay stable. The stored name remains the fallback. */}
+                    <Title level={4}>
+                        {resolveAnalysisName(analyses, analysisId, metaAnalyses) || analysisName}
+                    </Title>
                     {/* Reports stay fully readable on a view-only import; only renaming and
                         deleting are withheld, since both write to the study. Passing undefined
                         omits the buttons — InsightList already filters them out. */}

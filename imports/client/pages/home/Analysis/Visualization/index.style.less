@@ -29,6 +29,22 @@
   }
 }
 
+// The pinned tab bar carries the three tabs that must stay reachable however many analyses a study
+// has. It is a real antd Tabs so it keeps the card styling, the aria roles and arrow-key navigation,
+// but its panes are rendered by the page rather than by it — so it has an empty content holder that
+// would otherwise sit under the tab bar contributing nothing but a white band.
+.viz-pinned-tabs {
+  .ant-tabs-content-holder {
+    display: none;
+  }
+
+  // It lives inside the outer bar's extra slot, where the outer .ant-tabs-nav already supplies the
+  // bottom margin.
+  .ant-tabs-nav {
+    margin: 0;
+  }
+}
+
 .venntooltip {
   position: absolute;
   text-align: center;

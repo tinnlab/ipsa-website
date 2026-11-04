@@ -20,6 +20,7 @@ import {
     TreeSelect,
     Tabs,
     Divider,
+    Alert,
     notification
 } from 'antd';
 import {
@@ -39,7 +40,8 @@ import {
     selectPathways,
     DEFAULT_SORT,
     SELECTION_MODES,
-    PATHWAY_COLUMNS
+    PATHWAY_COLUMNS,
+    SIGNIFICANCE_FDR_THRESHOLD
 } from "../../../../../../../utils/pathwaySelection";
 import {
     selectTopGenes,
@@ -49,11 +51,27 @@ import {
 } from "../../../../../../../utils/geneSelection";
 import {
     collectSubmissionSelections,
-    describeSelectedSections
+    describeSelectedSections,
+    mandatorySections
 } from "../../../../../../../utils/aiSectionGating";
 import { capTags, moreTagLabel } from "../../../../../../../utils/tagDisplay";
-import { aggregateMetadataValue } from "../../../../../../../utils/metadataValues";
+import {
+    resolveAnalysisName,
+    nonEmptyLabel
+} from "../../../../../../../utils/metaAnalysisGeneLevel";
+import {
+    metaSelectionDatasets,
+    datasetMetadataByName,
+    extractedMetadataByName,
+    consolidateMetadata
+} from "../../../../../../../utils/metaAnalysisContext";
 import { firstPanelKeys, resolveViewInsight, resolveExitWizard } from "../../../../../../../utils/insightListModel";
+import { interpretationRefusal } from "/imports/utils/inputTypePolicy";
+import useInputTypePolicy from "/imports/client/hooks/useInputTypePolicy";
+import {
+    indexCustomGeneSets,
+} from "../../../../../../../utils/metaPathwayInfo";
+import {loadMetaPathwayTables} from '/imports/client/utils/metaPathwayData';
 import { useGlobalSettings } from "../../../../../../contexts/GlobalSettingsContext";
 
 // Import components and utilities
@@ -194,7 +212,9 @@ const VirtualPathwayTable = ({data, selectedPathways, onSelectionChange, onSortC
                 columns={columns}
                 dataSource={data}
                 rowKey="id"
-                rowClassName={(record) => record.pValueFDR < 0.05 ? 'significant-row' : ''}
+                // Inclusive, like "All Significant" in selectPathways: a pathway at exactly the
+                // threshold is significant, so the highlight and the selection agree.
+                rowClassName={(record) => record.pValueFDR <= SIGNIFICANCE_FDR_THRESHOLD ? 'significant-row' : ''}
                 onChange={(pagination, filters, sorter, extra) => {
                     // Only react to sort changes (not name-filter / pagination), so the
                     // top selection isn't reshuffled when the user just filters the table.
@@ -324,7 +344,8 @@ const VirtualGeneTable = ({data, selectedGenes, onSelectionChange, analyses, sel
                 columns={columns}
                 dataSource={data}
                 rowKey="id"
-                rowClassName={(record) => record.pValueFDR < 0.05 ? 'significant-row' : ''}
+                // Inclusive (FDR <= 0.05), matching the gene filters' FDR <= convention.
+                rowClassName={(record) => record.pValueFDR <= 0.05 ? 'significant-row' : ''}
             />
         </>
     );
@@ -353,7 +374,9 @@ const LoadingOverlay = ({loading, loadingMessage, loadingProgress, pipelineProgr
                     background: '#fff',
                     borderRadius: '12px',
                     padding: '24px',
-                    maxWidth: '800px',
+                    // 1040, not 800: the meta pipeline's 8-step row needs the width to stay on one
+                    // line with readable labels. Arithmetic in PipelineProgress.less.
+                    maxWidth: '1040px',
                     width: '90%',
                     boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)'
                 }}>
@@ -364,7 +387,7 @@ const LoadingOverlay = ({loading, loadingMessage, loadingProgress, pipelineProgr
                         fontWeight: 600,
                         color: '#1890ff'
                     }}>
-                        Generating AI Report
+                        Generating Report
                     </div>
                     <PipelineProgress
                         totalSteps={pipelineProgress.totalSteps}
@@ -451,6 +474,13 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
     const [geneFilterFC, setGeneFilterFC] = useState(globalSettings.foldChange);
     const [customGeneFDRInput, setCustomGeneFDRInput] = useState('');
     const [customGeneFCInput, setCustomGeneFCInput] = useState('');
+    // Pathway table thresholds ("pValue.FDR <= X and |Score| >= Y"), shared by every database
+    // panel. They narrow "Top N" and "All Significant" when the user changes N, the mode, the sort
+    // or a threshold; the on-load auto-selection does not apply them.
+    const [pathwayFilterFDR, setPathwayFilterFDR] = useState(globalSettings.pValueFDR);
+    const [pathwayFilterScore, setPathwayFilterScore] = useState(globalSettings.enrichmentScore);
+    const [customPathwayFDRInput, setCustomPathwayFDRInput] = useState('');
+    const [customPathwayScoreInput, setCustomPathwayScoreInput] = useState('');
     const [loading, setLoading] = useState(false);
     const [loadingMessage, setLoadingMessage] = useState('');
     const [pipelineProgress, setPipelineProgress] = useState(null);
@@ -463,6 +493,11 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
     const [selectedInsight, setSelectedInsight] = useState(null);
     const [insightName, setInsightName] = useState('');
     const [analysesMetadata, setAnalysesMetadata] = useState({});
+    // How much of a selected meta-analysis's evidence this study actually holds: `found` datasets
+    // resolved, `missingIds` sources that are not here. Tracked so the shortfall can be shown rather
+    // than silently shrinking the report's evidence. `found` counts resolved DATASETS, not metadata
+    // maps — a dataset with no metadata still contributes its pathways and genes to the report.
+    const [metaSourceCoverage, setMetaSourceCoverage] = useState({missingIds: [], found: 0});
     const [customContext, setCustomContext] = useState('');
 
     // Metadata validation states
@@ -491,6 +526,15 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
     const [conditionSearchText, setConditionSearchText] = useState('');
     const [controlSearchText, setControlSearchText] = useState('');
 
+    // The ONE place this wizard turns an analysis id into a label. Meta-analyses live on
+    // Session.metaAnalyses[], not in the `analyses` map, so every site that read `analyses[id].name`
+    // resolved a meta id to nothing — raw ids in the review step and the tab titles, "Analysis <id>"
+    // saved onto the report, and one label that rendered as a bare ':'.
+    const analysisLabel = useCallback(
+        (id) => resolveAnalysisName(analyses, id, metaAnalyses) || `Analysis ${id}`,
+        [analyses, metaAnalyses]
+    );
+
     // Track validation state - only show errors after user tries to proceed
     const [showValidationErrors, setShowValidationErrors] = useState(false);
 
@@ -498,6 +542,8 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
     useEffect(() => {
         setGeneFilterFDR(globalSettings.pValueFDR);
         setGeneFilterFC(globalSettings.foldChange);
+        setPathwayFilterFDR(globalSettings.pValueFDR);
+        setPathwayFilterScore(globalSettings.enrichmentScore);
     }, [globalSettings]);
 
     // Pre-select an analysis when the wizard is opened from the AI-interpretation sidebar by
@@ -644,8 +690,37 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
         return () => window.removeEventListener('resize', calculateHeight);
     }, [currentStep]);
 
+    // Why each pickable entry cannot be interpreted, keyed by id (absent = it can). The same rule
+    // aiWorkflow.startPublicationReady enforces (imports/utils/inputTypePolicy.js): a single
+    // analysis of a blocked input type or with no gene-level results; a meta / mass analysis whose
+    // datasets are all blocked or none has results. Mixed metas stay selectable.
+    const {interpretationBlockedInputTypes} = useInputTypePolicy();
+    const unavailableById = useMemo(() => {
+        const configById = new Map((configs || []).map(c => [c.analysisId, c]));
+        const datasetOf = (analysis) => ({
+            inputType: analysis?.input ?? configById.get(analysis?.id)?.inputType,
+            hasGeneResults: configById.get(analysis?.id)?.hasGeneResults
+        });
+        const metaIds = new Set((metaAnalyses || []).map(m => m.id));
+        const result = {};
+        for (const id of [...metaIds, ...Object.keys(analyses || {})]) {
+            const isMeta = metaIds.has(id) || Boolean(analyses?.[id]?.isMassAnalysis);
+            const datasets = isMeta
+                ? metaSelectionDatasets(id, analyses, metaAnalyses).datasets.map(datasetOf)
+                : [datasetOf({...analyses[id], id})];
+            const refusal = interpretationRefusal(datasets, {isMeta, blocked: interpretationBlockedInputTypes});
+            if (refusal) result[id] = refusal.reason;
+        }
+        return result;
+    }, [analyses, metaAnalyses, configs, interpretationBlockedInputTypes]);
+
     React.useEffect(() => {
-        // Create tree data for TreeSelect
+        // Create tree data for TreeSelect. An entry that cannot be interpreted stays visible but
+        // disabled, and the reason is listed under the picker. `title` must stay a string: the
+        // search filter lower-cases it.
+        const unavailable = (id) => unavailableById[id]
+            ? {disabled: true, titleSuffix: ' (interpretation unavailable)'}
+            : {disabled: false, titleSuffix: ''};
         const createTreeData = () => {
             const treeData = [];
             const groupedItems = {};
@@ -666,17 +741,19 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                             };
                         }
                         groupedItems[meta.groupId].children.push({
-                            title: `📊 ${meta.name}`,
+                            title: `📊 ${meta.name}${unavailable(meta.id).titleSuffix}`,
                             value: meta.id,
                             key: meta.id,
+                            disabled: unavailable(meta.id).disabled,
                             isLeaf: true
                         });
                     } else {
                         // Ungrouped meta analysis
                         treeData.push({
-                            title: `📊 ${meta.name}`,
+                            title: `📊 ${meta.name}${unavailable(meta.id).titleSuffix}`,
                             value: meta.id,
                             key: meta.id,
+                            disabled: unavailable(meta.id).disabled,
                             isLeaf: true
                         });
                     }
@@ -706,18 +783,20 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                         };
                     }
                     groupedItems[analysis.groupId].children.push({
-                        title: `📊 ${analysis.name}`,
+                        title: `📊 ${analysis.name}${unavailable(id).titleSuffix}`,
                         value: id,
                         key: id,
+                        disabled: unavailable(id).disabled,
                         isLeaf: true
                     });
                 } else {
                     // Regular analysis or ungrouped mass analysis
                     const icon = analysis.isMassAnalysis ? '📊 ' : '';
                     treeData.push({
-                        title: `${icon}${analysis.name}`,
+                        title: `${icon}${analysis.name}${unavailable(id).titleSuffix}`,
                         value: id,
                         key: id,
+                        disabled: unavailable(id).disabled,
                         isLeaf: true
                     });
                 }
@@ -744,7 +823,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
 
         const newTreeData = createTreeData();
         setOptions(newTreeData);
-    }, [analyses, metaAnalyses]);
+    }, [analyses, metaAnalyses, unavailableById]);
 
     React.useEffect(() => {
         const fetchGenes = async () => {
@@ -814,6 +893,16 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
         fetchGenes();
     }, [selectedAnalyses, sessionId]);
 
+    // Pathways and DE Genes are mandatory: the section checkboxes are hidden, so the flags are
+    // pinned here instead of toggled. Genes follow gene-level data availability rather than being
+    // forced on, so an analysis without DE data is never described as having a DE Genes section.
+    useEffect(() => {
+        setSelectedSections(mandatorySections({
+            analysisIds: selectedAnalyses.filter(id => !id.startsWith('group_')),
+            genes
+        }));
+    }, [selectedAnalyses, genes]);
+
     const fetchAnalysisResults = async (analysisId) => {
         const analysis = analyses[analysisId];
         const config = configs.find(c => c.analysisId === analysisId);
@@ -864,18 +953,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
             setSelectedAnalyses(actualAnalysisIds);
             if (actualAnalysisIds.length === 0) return;
 
-            const getAnalysisName = (analysisId) => {
-                if (analyses[analysisId]) {
-                    return analyses[analysisId].name;
-                }
-                const metaAnalysis = metaAnalyses?.find(meta => meta.id === analysisId);
-                if (metaAnalysis) {
-                    return metaAnalysis.name;
-                }
-                return `Analysis ${analysisId}`;
-            };
-
-            const firstAnalysisName = getAnalysisName(actualAnalysisIds[0]);
+            const firstAnalysisName = analysisLabel(actualAnalysisIds[0]);
             const insightNameSuffix = actualAnalysisIds.length > 1
                 ? ` (${actualAnalysisIds.length} analyses)`
                 : '';
@@ -893,66 +971,64 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                 }
             });
 
-            // For meta-analyses, fetch per-dataset metadata from the mass analysis
+            // A meta-analysis is not itself in `analyses`, so the loop above finds nothing for it:
+            // its context is the metadata of the DATASETS it was computed from.
             const isMetaSelection = actualAnalysisIds.length === 1 && (
                 analyses[actualAnalysisIds[0]]?.isMassAnalysis ||
                 metaAnalyses?.some(meta => meta.id === actualAnalysisIds[0])
             );
 
+            let coverage = {missingIds: [], found: 0};
+
             if (isMetaSelection && Object.keys(metadata).length === 0) {
-                try {
-                    const allAnalysesArray = Object.values(analyses);
-                    const massAnalysisIds = new Set();
-                    allAnalysesArray.forEach(a => {
-                        if (a.massAnalysisId) massAnalysisIds.add(a.massAnalysisId);
-                    });
+                // Rebuild the map from the study's own analyses. This is what makes a SHARED study
+                // work: the clone drops massAnalysisId (it would name the donor's queue row) and
+                // copies no MassAnalysisQueue rows, so the server call below cannot answer for it —
+                // but Session.analyses[].metadata survives the clone untouched, and that is the same
+                // object the queue's analysesMetadata was built from.
+                const {datasets, missingIds} = metaSelectionDatasets(
+                    actualAnalysisIds[0], analyses, metaAnalyses
+                );
+                coverage = {missingIds, found: datasets.length};
+                Object.assign(metadata, extractedMetadataByName(datasetMetadataByName(datasets)));
 
-                    if (massAnalysisIds.size > 0) {
-                        const massAnalysisId = Array.from(massAnalysisIds)[0];
-                        const datasetsMetadata = await Meteor.callAsync('massAnalysis.getMetadata', {
-                            massAnalysisId
-                        });
+                if (missingIds.length > 0) {
+                    console.warn(
+                        `Meta-analysis ${actualAnalysisIds[0]}: ${missingIds.length} of ` +
+                        `${datasets.length + missingIds.length} source analyses are not in this study ` +
+                        `and contribute no data. Ids: ${missingIds.join(', ')}`
+                    );
+                }
 
-                        // Populate analysesMetadata with per-dataset extracted metadata
-                        Object.entries(datasetsMetadata).forEach(([datasetName, meta]) => {
-                            const extracted = meta?.extracted || meta;
-                            if (extracted && Object.keys(extracted).length > 0) {
-                                metadata[datasetName] = extracted;
-                            }
-                        });
+                // Older studies whose analysis entries predate per-analysis metadata still have it
+                // on the mass-analysis row, so fall back to the server for those.
+                if (Object.keys(metadata).length === 0) {
+                    try {
+                        const massAnalysisId = Object.values(analyses)
+                            .find(a => a && a.massAnalysisId)?.massAnalysisId;
 
-                        // Auto-build consolidatedMetadata by aggregating common values
-                        if (Object.keys(metadata).length > 0) {
-                            const allFields = new Set();
-                            Object.values(metadata).forEach(m => Object.keys(m).forEach(k => allFields.add(k)));
-
-                            const aggregated = {};
-                            allFields.forEach(field => {
-                                const values = Object.values(metadata)
-                                    .map(m => m[field])
-                                    .filter(v => v !== undefined && v !== null && v !== '');
-                                if (values.length > 0) {
-                                    // Merge values differing only by case/whitespace (e.g. "female"/"Female").
-                                    aggregated[field] = aggregateMetadataValue(values);
-                                }
+                        if (massAnalysisId) {
+                            const datasetsMetadata = await Meteor.callAsync('massAnalysis.getMetadata', {
+                                massAnalysisId
                             });
-
-                            setConsolidatedMetadata({
-                                organism: aggregated.organism || aggregated.Organism || 'Homo sapiens',
-                                tissue: aggregated.tissue || aggregated.Tissue || '',
-                                disease: aggregated.disease || aggregated.Disease || null,
-                                comparison: aggregated.comparison || aggregated.Comparison || '',
-                                experimental_context: aggregated.experimental_context || aggregated.description || '',
-                                study_type: 'disease'
-                            });
-                            console.log('📊 Auto-built consolidatedMetadata from mass analysis datasets');
+                            Object.assign(metadata, extractedMetadataByName(datasetsMetadata));
                         }
+                    } catch (err) {
+                        console.warn('Could not fetch mass analysis metadata:', err);
                     }
-                } catch (err) {
-                    console.warn('Could not fetch mass analysis metadata:', err);
+                }
+
+                // Auto-build consolidatedMetadata by aggregating common values. This used to live
+                // inside the mass-analysis branch, so a cloned or never-mass meta-analysis got no
+                // consolidated context even when its per-dataset metadata was right there.
+                const consolidated = consolidateMetadata(metadata);
+                if (consolidated) {
+                    setConsolidatedMetadata(consolidated);
+                    console.log('📊 Auto-built consolidatedMetadata from the meta-analysis datasets');
                 }
             }
 
+            setMetaSourceCoverage(coverage);
             setAnalysesMetadata(metadata);
             console.log('📋 Extracted analyses metadata:', metadata);
 
@@ -1007,6 +1083,29 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                 }).filter(gene => gene); // Remove any null/undefined values
             };
 
+            // The study's custom gene sets, fetched at most once for the whole run. The data is
+            // session-scoped, so every meta-analysis in this selection would otherwise refetch the
+            // same payload — and one MitoPathways-sized gene set is ~100KB of gene symbols. The
+            // guard needs an analysisId, so the first meta to ask supplies it; the answer is
+            // identical for every analysis in the session.
+            let customGeneSetsPromise = null;
+            const loadCustomGeneSets = (analysisId) => {
+                if (!customGeneSetsPromise) {
+                    customGeneSetsPromise = Meteor.callAsync('session.get.custom.geneSets', {
+                        sessionId,
+                        analysisId
+                    }).then(indexCustomGeneSets).catch(error => {
+                        // Non-fatal: a study with no custom gene sets is the common case, and a
+                        // failure here must not cost the built-in databases their names. Reset so a
+                        // later analysis can retry rather than inheriting this failure.
+                        console.warn('Could not load custom gene sets for this study:', error);
+                        customGeneSetsPromise = null;
+                        return new Map();
+                    });
+                }
+                return customGeneSetsPromise;
+            };
+
             for (let i = 0; i < actualAnalysisIds.length; i++) {
                 const analysisId = actualAnalysisIds[i];
                 setLoadingMessage(`Processing analysis ${i + 1} of ${actualAnalysisIds.length}...`);
@@ -1024,77 +1123,19 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                         const geneIdToSymbolMap = await createGeneIdToSymbolMap(analysisId);
                         console.log(`Gene mapping loaded for meta-analysis ${analysisId}: ${geneIdToSymbolMap.size} genes`);
 
-                        // Fetch pathway results for this meta-analysis
-                        const metaResults = await Meteor.callAsync('visualization.getMetaAnalysisResults', {
-                            sessionId: sessionId,
-                            analysisId: analysisId
+                        // Fetch this meta-analysis's pathway results as per-database tables. The
+                        // loader is shared with the report's Consensus Results modal, which must
+                        // rebuild the same database names and row ids to mark the selection.
+                        const formattedData = await loadMetaPathwayTables({
+                            sessionId,
+                            analysisId,
+                            dbIdToNameMapping,
+                            geneIdToSymbolMap,
+                            loadCustomGeneSets,
+                            onLoadingPathways: () => setLoadingMessage(`Processing meta-analysis ${i + 1} of ${actualAnalysisIds.length} - Loading pathways...`),
                         });
 
-                        const pathwayResults = metaResults.pathwayLevel;
-
-                        if (!pathwayResults || pathwayResults.length === 0) continue;
-
-                        // Get unique pathway IDs to fetch gene lists
-                        const allPathwayIds = new Set();
-                        pathwayResults.forEach(dbResult => {
-                            if (dbResult.value && Array.isArray(dbResult.value)) {
-                                dbResult.value.forEach(pathway => {
-                                    allPathwayIds.add(pathway.ID);
-                                });
-                            }
-                        });
-
-                        // Fetch gene sets to get pathway names and genes
-                        setLoadingMessage(`Processing meta-analysis ${i + 1} of ${actualAnalysisIds.length} - Loading pathways...`);
-                        const geneSets = await Meteor.callAsync('geneSet.getByIds', {
-                            ids: Array.from(allPathwayIds)
-                        });
-
-                        const pathwayInfoMap = new Map();
-                        geneSets.forEach(gs => {
-                            // Convert gene IDs to symbols
-                            const geneSymbols = (gs.genes || [])
-                                .map(geneId => geneIdToSymbolMap.get(String(geneId)) || null)
-                                .filter(Boolean);
-
-                            pathwayInfoMap.set(gs.id, {
-                                name: gs.name,
-                                genes: geneSymbols  // Store gene symbols, not IDs
-                            });
-                        });
-
-                        // Format results for the UI
-                        const formattedData = pathwayResults.map(dbResult => {
-                            const pathways = [];
-                            const databaseName = dbIdToNameMapping[dbResult.databaseId] || dbResult.databaseId;
-
-                            if (dbResult.value && Array.isArray(dbResult.value)) {
-                                dbResult.value.forEach(pathway => {
-                                    const pathwayInfo = pathwayInfoMap.get(pathway.ID);
-                                    if (pathwayInfo) {
-                                        pathways.push({
-                                            id: `${databaseName}:${pathway.ID}`,
-                                            originalId: pathway.ID,
-                                            name: pathwayInfo.name,
-                                            pValue: pathway.pValue,
-                                            pValueFDR: pathway.pFDR,
-                                            // `score` is the enrichment score (NES here);
-                                            // carry normalizedScore through when present (meta)
-                                            // so the interpretation service labels it as NES.
-                                            score: pathway.score,
-                                            normalizedScore: pathway.normalizedScore,
-                                            database: databaseName,
-                                            genes: pathwayInfo.genes
-                                        });
-                                    }
-                                });
-                            }
-
-                            return {
-                                database: databaseName,
-                                pathways: pathways
-                            };
-                        });
+                        if (!formattedData) continue;
 
                         pathwayDataResults[analysisId] = formattedData;
 
@@ -1355,9 +1396,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                 metaAnalyses?.some(meta => meta.id === actualAnalysisIds[0])
             );
 
-            const analysisNames = actualAnalysisIds.map(id =>
-                analyses[id]?.name || `Analysis ${id}`
-            );
+            const analysisNames = actualAnalysisIds.map(id => analysisLabel(id));
             const batchAnalysisName = analysisNames.length === 1
                 ? analysisNames[0]
                 : `Multi-Analysis (${analysisNames.slice(0, 2).join(', ')}${analysisNames.length > 2 ? '...' : ''})`;
@@ -1381,30 +1420,65 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
             // Fetch meta-analysis data if needed
             let metaAnalysisData = null;
             if (isMetaAnalysis) {
-                const allAnalysesArray = Object.values(analyses);
-                const massAnalysisIds = new Set();
-
-                allAnalysesArray.forEach(a => {
-                    if (a.massAnalysisId) {
-                        massAnalysisIds.add(a.massAnalysisId);
-                    }
-                });
-
-                if (massAnalysisIds.size === 0) {
-                    throw new Error('No mass analysis found in this session.');
-                }
-
-                const massAnalysisId = Array.from(massAnalysisIds)[0];
                 setLoadingMessage('Preparing meta-analysis data...');
 
-                const datasetsMetadata = await Meteor.callAsync('massAnalysis.getMetadata', {
-                    massAnalysisId
-                });
-
-                const individualAnalyses = allAnalysesArray.filter(a => a.massAnalysisId === massAnalysisId);
+                // The datasets come from the study itself, so this works on a CLONE. It used to
+                // require a massAnalysisId and threw 'No mass analysis found in this session.'
+                // without one — which a cloned study never has (the clone drops the pointer and
+                // copies no queue rows), and neither does any meta-analysis built from ordinary
+                // analyses. Generating a report for either was impossible, not merely context-free.
+                const {datasets: individualAnalyses, missingIds} = metaSelectionDatasets(
+                    actualAnalysisIds[0], analyses, metaAnalyses
+                );
 
                 if (individualAnalyses.length === 0) {
-                    throw new Error('No individual datasets found for this meta-analysis.');
+                    // Every analysis this meta records has been removed from the study.
+                    //
+                    // Deliberately NOT falling back to the mass-analysis cohort here, which is what
+                    // the old code did. These datasets become the pipeline's datasets[] — the
+                    // per-dataset evidence the reproducibility and discovery steps compare — so
+                    // substituting a different set produces a report attributed to this
+                    // meta-analysis but computed from data it was never run over. It would also be
+                    // incoherent with the partial case just above: 7 of 8 sources missing proceeds
+                    // with the 1 that remains and a visible warning, so 8 of 8 missing must not
+                    // silently receive MORE data than that, and the wrong data at that.
+                    //
+                    // (A legacy meta entry that records no sources at all still falls back to the
+                    // cohort — see metaSelectionDatasets. That case is different: nothing says what
+                    // the meta covered, so the cohort is the only answer available and matches what
+                    // those studies have always sent.)
+                    throw new Error(missingIds.length > 0
+                        ? `This meta-analysis was computed from ${missingIds.length} `
+                            + `${missingIds.length === 1 ? 'analysis that is' : 'analyses that are'} `
+                            + 'no longer part of this study, so it has no dataset evidence left to '
+                            + `report on. Missing analysis ${missingIds.length === 1 ? 'id' : 'ids'}: `
+                            + `${missingIds.join(', ')}. Restore `
+                            + `${missingIds.length === 1 ? 'it' : 'them'}, or rebuild the `
+                            + 'meta-analysis from the analyses this study still has.'
+                        : 'No individual datasets found for this meta-analysis.');
+                }
+
+                // datasetMetadataByName keeps the {extracted: …} nesting on purpose: the server
+                // reads datasetsMetadata[name]?.extracted when it builds the payload, so a flattened
+                // map would empty every dataset's metadata in the request.
+                let datasetsMetadata = datasetMetadataByName(individualAnalyses);
+
+                if (Object.keys(datasetsMetadata).length === 0) {
+                    // Older studies carry the metadata only on the mass-analysis row.
+                    const massAnalysisId = individualAnalyses.find(a => a && a.massAnalysisId)?.massAnalysisId;
+                    if (massAnalysisId) {
+                        datasetsMetadata = await Meteor.callAsync('massAnalysis.getMetadata', {
+                            massAnalysisId
+                        });
+                    }
+                }
+
+                if (missingIds.length > 0) {
+                    console.warn(
+                        `Meta-analysis ${actualAnalysisIds[0]}: generating a report from ` +
+                        `${individualAnalyses.length} datasets; ${missingIds.length} source ` +
+                        `analyses are not in this study. Ids: ${missingIds.join(', ')}`
+                    );
                 }
 
                 metaAnalysisData = {
@@ -1413,7 +1487,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                 };
             }
 
-            setLoadingMessage('Running Publication-Ready workflow with fact-checking...');
+            setLoadingMessage('Generating interpretation report...');
 
             try {
                 // Submit job to external API
@@ -1421,7 +1495,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                     pathways: allSelectedPathways,
                     genes: allSelectedGenes,
                     analyses: actualAnalysisIds.map(id => {
-                        const analysisName = analyses[id]?.name || `Analysis ${id}`;
+                        const analysisName = analysisLabel(id);
                         const metadata = analysesMetadata[analysisName] || {};
 
                         return {
@@ -1641,6 +1715,101 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
         </Card>
     );
 
+    // "Only pathways with pValue.FDR <= X and |Score| >= Y" — the same Select + custom-input shape
+    // as the DE genes block. Disabled under "All", which ignores the thresholds.
+    const renderPathwayThresholdControls = (modeValue) => {
+        const isAll = modeValue === 'all';
+        return (
+            <Space direction="vertical" size={4}>
+                <Space wrap>
+                    <Text>Only pathways with:</Text>
+                    <Text>pValue.FDR &le;</Text>
+                    <Select
+                        value={pathwayFilterFDR}
+                        onChange={(val) => handlePathwayThresholdChange({maxFdr: val})}
+                        style={{width: 100}}
+                        size="small"
+                        disabled={isAll}
+                        dropdownRender={(menu) => (
+                            <>
+                                {menu}
+                                <Divider style={{margin: '8px 0'}} />
+                                <Space style={{padding: '0 8px 4px'}}>
+                                    <InputNumber
+                                        placeholder="Custom"
+                                        value={customPathwayFDRInput}
+                                        onChange={(val) => {
+                                            if (val !== null && val >= 0 && val <= 1) {
+                                                setCustomPathwayFDRInput(val);
+                                                handlePathwayThresholdChange({maxFdr: val});
+                                            }
+                                        }}
+                                        min={0}
+                                        max={1}
+                                        step={0.01}
+                                        size="small"
+                                        style={{width: 80}}
+                                    />
+                                </Space>
+                            </>
+                        )}
+                    >
+                        <Option value={0.01}>0.01</Option>
+                        <Option value={0.05}>0.05</Option>
+                        <Option value={0.1}>0.1</Option>
+                    </Select>
+                    <Text>and |Score| &ge;</Text>
+                    <Select
+                        value={pathwayFilterScore}
+                        onChange={(val) => handlePathwayThresholdChange({minAbsScore: val})}
+                        style={{width: 100}}
+                        size="small"
+                        disabled={isAll}
+                        dropdownRender={(menu) => (
+                            <>
+                                {menu}
+                                <Divider style={{margin: '8px 0'}} />
+                                <Space style={{padding: '0 8px 4px'}}>
+                                    <InputNumber
+                                        placeholder="Custom"
+                                        value={customPathwayScoreInput}
+                                        onChange={(val) => {
+                                            if (val !== null && val >= 0 && val <= 10) {
+                                                setCustomPathwayScoreInput(val);
+                                                handlePathwayThresholdChange({minAbsScore: val});
+                                            }
+                                        }}
+                                        min={0}
+                                        max={10}
+                                        step={0.1}
+                                        size="small"
+                                        style={{width: 80}}
+                                    />
+                                </Space>
+                            </>
+                        )}
+                    >
+                        <Option value={0}>0</Option>
+                        <Option value={0.5}>0.5</Option>
+                        <Option value={1.0}>1.0</Option>
+                        <Option value={1.5}>1.5</Option>
+                        <Option value={2.0}>2.0</Option>
+                    </Select>
+                </Space>
+                {modeValue === 'allSignificant' && (
+                    <Text type="secondary" style={{fontSize: 12}}>
+                        All Significant also requires pValue.FDR &le; {SIGNIFICANCE_FDR_THRESHOLD}.
+                    </Text>
+                )}
+                {isAll && (
+                    <Text type="secondary" style={{fontSize: 12}}>
+                        "All" selects every pathway; the thresholds don't apply.
+                    </Text>
+                )}
+            </Space>
+        );
+    };
+
     const getCollapseItems = (analysisId) => {
         if (!pathwayData[analysisId]) return [];
 
@@ -1656,6 +1825,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
             label: db.database,
             children: (
                 <Space direction="vertical" style={{width: '100%'}} size="large">
+                    {renderPathwayThresholdControls(dbTopN[`${analysisId}:${db.database}`])}
                     <Radio.Group
                         value={
                             dbTopN[`${analysisId}:${db.database}`] === 'allSignificant' ? 'allSignificant' :
@@ -1753,6 +1923,39 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
         );
     };
 
+    // A meta-analysis records the analyses it was computed from. When some of those are not in this
+    // study — deleted since, or filtered out of the analyses map because they have no pathway
+    // results — the report is built from fewer datasets than the meta covers. Say so on screen: the
+    // alternative is a quietly smaller payload that looks exactly like a complete one.
+    const renderUnresolvedSourcesWarning = () => {
+        const {missingIds, found} = metaSourceCoverage;
+        if (!missingIds.length) return null;
+        const total = found + missingIds.length;
+        // found === 0 is not a degree of the same warning: there is nothing left to report on, and
+        // generating is refused rather than run over substituted datasets.
+        const none = found === 0;
+        return (
+            <Alert
+                type={none ? 'error' : 'warning'}
+                showIcon
+                style={{marginBottom: 12}}
+                message={none
+                    ? 'None of this meta-analysis’s datasets are in this study'
+                    : `${missingIds.length} of ${total} datasets are not available in this study`}
+                description={
+                    <>
+                        This meta-analysis was computed from {total} {total === 1 ? 'analysis' : 'analyses'},
+                        but {missingIds.length} of them {missingIds.length === 1 ? 'is' : 'are'} no longer
+                        part of this study, so {none
+                            ? 'there is no dataset evidence left to report on. Restore them, or rebuild the meta-analysis from the analyses this study still has.'
+                            : `the report will be generated from the other ${found}.`} Missing
+                        analysis {missingIds.length === 1 ? 'id' : 'ids'}: {missingIds.join(', ')}.
+                    </>
+                }
+            />
+        );
+    };
+
     // Collapsed-by-default list of names (pathways/genes) for the review step, so a
     // selection of thousands doesn't render one giant text block. Click to expand.
     const renderCollapsibleNameList = (names, singular) => {
@@ -1801,11 +2004,14 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
     };
 
     // Apply a top-N / all-significant / all selection for one database, ranking by
-    // the table's current sort. Shared by handleTopNChange and handleSortChange.
-    const applyPathwaySelection = (analysisId, database, value, sort) => {
+    // the table's current sort. Shared by handleTopNChange, handleSortChange and
+    // handlePathwayThresholdChange. `thresholds` defaults to the current pathway
+    // thresholds; a threshold change passes the new values, which aren't in state yet.
+    const applyPathwaySelection = (analysisId, database, value, sort,
+                                   thresholds = {maxFdr: pathwayFilterFDR, minAbsScore: pathwayFilterScore}) => {
         const pathways = pathwayData[analysisId]?.find(d => d.database === database)?.pathways || [];
         const mode = (value === 'allSignificant' || value === 'all') ? value : SELECTION_MODES.TOP;
-        const topPathways = selectPathways(pathways, sort.columnKey, sort.order, mode, value);
+        const topPathways = selectPathways(pathways, sort.columnKey, sort.order, mode, value, thresholds);
 
         // Replace only this database's pathways, keeping every other database's
         // selection. Match on the structured `database` field (not an id prefix,
@@ -1831,6 +2037,23 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
         if (currentVal === 'allSignificant' || currentVal === 'all') return;
         const n = (currentVal && !isNaN(currentVal)) ? currentVal : '20';
         applyPathwaySelection(analysisId, database, n, sort);
+    };
+
+    // A pathway threshold changed: re-pick every database panel the user has set a mode on,
+    // except "All", which ignores the thresholds. Panels are keyed `${analysisId}:${database}`;
+    // analysis ids never contain ':', so split at the first one (database names may).
+    const handlePathwayThresholdChange = ({maxFdr = pathwayFilterFDR, minAbsScore = pathwayFilterScore}) => {
+        setPathwayFilterFDR(maxFdr);
+        setPathwayFilterScore(minAbsScore);
+        Object.keys(dbTopN).forEach(key => {
+            const value = dbTopN[key];
+            if (value === 'all') return;
+            const cut = key.indexOf(':');
+            const analysisId = key.slice(0, cut);
+            const database = key.slice(cut + 1);
+            const sort = dbSort[key] || DEFAULT_SORT;
+            applyPathwaySelection(analysisId, database, value, sort, {maxFdr, minAbsScore});
+        });
     };
 
     const handleGenesTopNChange = (value, analysisId = null) => {
@@ -1872,7 +2095,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
         }
     };
 
-    // "Select top N genes with FDR < X and |Log2FC| > Y": filter by the thresholds,
+    // "Select top N genes with FDR <= X and |Log2FC| >= Y": filter by the thresholds,
     // then keep the top N by pValue ascending.
     const handleSelectTopGenes = (analysisId = null) => {
         const topN = parseInt(genesTopN) || DEFAULT_GENE_TOP_N;
@@ -1922,11 +2145,15 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
             case 0:
                 const actualAnalysisIds = selectedAnalyses.filter(id => !id.startsWith('group_'));
                 const hasSelectedAnalyses = actualAnalysisIds.length > 0;
+                // With both sections mandatory, hasSelectedSections is always true; hasData is the
+                // real guard — no pathways and no genes selected still blocks Next.
                 const hasSelectedSections = selectedSections.pathways || selectedSections.genes;
                 const hasData = (selectedSections.pathways && Object.values(selectedPathways).some(pathways => pathways.length > 0)) ||
                     (selectedSections.genes && Object.values(selectedGenes).some(genes => genes.length > 0));
+                // A pre-selected (deep-linked) analysis can still be one that cannot be interpreted.
+                const interpretable = !actualAnalysisIds.some(id => unavailableById[id]);
 
-                return hasSelectedAnalyses && hasSelectedSections && hasData;
+                return hasSelectedAnalyses && hasSelectedSections && hasData && interpretable;
             case 1:
                 // Check if metadata exists OR user has provided consolidated metadata via template
                 return Object.keys(analysesMetadata).length > 0 || consolidatedMetadata !== null;
@@ -1982,6 +2209,29 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                     return node.title.toLowerCase().includes(search.toLowerCase());
                                 }}
                             />
+                            {selectedAnalyses.filter(id => unavailableById[id]).map(id => (
+                                <Alert
+                                    key={id}
+                                    type="error"
+                                    showIcon
+                                    message={`${analysisLabel(id)} cannot be interpreted`}
+                                    description={unavailableById[id]}
+                                />
+                            ))}
+                            {Object.keys(unavailableById).length > 0 && (
+                                <Alert
+                                    type="info"
+                                    showIcon
+                                    message="Some analyses are unavailable for Biological Interpretation"
+                                    description={
+                                        <ul style={{margin: 0, paddingLeft: 20}}>
+                                            {Object.entries(unavailableById).map(([id, reason]) => (
+                                                <li key={id}><strong>{analysisLabel(id)}</strong>: {reason}</li>
+                                            ))}
+                                        </ul>
+                                    }
+                                />
+                            )}
                             <Space direction={'vertical'} style={{width: '100%'}}>
                                 <Typography.Text>Insight name:</Typography.Text>
                                 <Input
@@ -1998,6 +2248,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
 
                             <Card title={
                                 <Space>
+                                    {/* Hidden: the Pathways section is mandatory, so users cannot opt out.
                                     <Checkbox
                                         checked={selectedSections.pathways}
                                         onChange={(e) => setSelectedSections(prev => ({
@@ -2005,6 +2256,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                             pathways: e.target.checked
                                         }))}
                                     />
+                                    */}
                                     <span>Pathways</span>
                                 </Space>
                             }>
@@ -2029,7 +2281,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                         <Tabs
                                             type="card"
                                             items={actualAnalysisIds.map(analysisId => {
-                                                const analysisName = analyses[analysisId]?.name || `Analysis ${analysisId}`;
+                                                const analysisName = analysisLabel(analysisId);
                                                 return {
                                                     key: analysisId,
                                                     label: analysisName,
@@ -2039,17 +2291,21 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                         />
                                     );
                                 })()}
+                                {/* Unreachable now that the Pathways section is mandatory (no checkbox to untick).
                                 {!selectedSections.pathways && (
                                     <div style={{padding: '20px', textAlign: 'center', color: '#666'}}>
                                         Pathways section is disabled. Check the box above to include pathway information
                                         in the analysis.
                                     </div>
                                 )}
+                                */}
                             </Card>
 
                             {Object.keys(genes).length > 0 && (
                                 <Card title={
                                     <Space>
+                                        {/* Hidden: the DE Genes section is mandatory whenever gene-level data exists
+                                            (see mandatorySections), so users cannot opt out.
                                         <Checkbox
                                             checked={selectedSections.genes}
                                             onChange={(e) => setSelectedSections(prev => ({
@@ -2057,6 +2313,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                                 genes: e.target.checked
                                             }))}
                                         />
+                                        */}
                                         <span>DE Genes</span>
                                     </Space>
                                 }>
@@ -2085,7 +2342,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                                         style={{width: 70}}
                                                     />
                                                     <Text>genes with:</Text>
-                                                    <Text>pValue.FDR &lt;</Text>
+                                                    <Text>pValue.FDR &le;</Text>
                                                     <Select
                                                         value={geneFilterFDR}
                                                         onChange={setGeneFilterFDR}
@@ -2119,7 +2376,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                                         <Option value={0.05}>0.05</Option>
                                                         <Option value={0.1}>0.1</Option>
                                                     </Select>
-                                                    <Text>and |Log2FC| &gt;</Text>
+                                                    <Text>and |Log2FC| &ge;</Text>
                                                     <Select
                                                         value={geneFilterFC}
                                                         onChange={setGeneFilterFC}
@@ -2190,7 +2447,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                             <Tabs
                                                 type="card"
                                                 items={actualAnalysisIds.filter(analysisId => genes[analysisId]).map(analysisId => {
-                                                    const analysisName = analyses[analysisId]?.name || `Analysis ${analysisId}`;
+                                                    const analysisName = analysisLabel(analysisId);
                                                     return {
                                                         key: analysisId,
                                                         label: analysisName,
@@ -2207,7 +2464,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                                                         style={{width: 70}}
                                                                     />
                                                                     <Text>genes with:</Text>
-                                                                    <Text>pValue.FDR &lt;</Text>
+                                                                    <Text>pValue.FDR &le;</Text>
                                                                     <Select
                                                                         value={geneFilterFDR}
                                                                         onChange={setGeneFilterFDR}
@@ -2241,7 +2498,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                                                         <Option value={0.05}>0.05</Option>
                                                                         <Option value={0.1}>0.1</Option>
                                                                     </Select>
-                                                                    <Text>and |Log2FC| &gt;</Text>
+                                                                    <Text>and |Log2FC| &ge;</Text>
                                                                     <Select
                                                                         value={geneFilterFC}
                                                                         onChange={setGeneFilterFC}
@@ -2314,10 +2571,17 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                             />
                                         );
                                     })()}
+                                    {/* The checkbox is gone, so genes are off only when there is no gene-level data.
                                     {!selectedSections.genes && (
                                         <div style={{padding: '20px', textAlign: 'center', color: '#666'}}>
                                             DE Genes section is disabled. Check the box above to include gene
                                             information in the analysis.
+                                        </div>
+                                    )}
+                                    */}
+                                    {!selectedSections.genes && (
+                                        <div style={{padding: '20px', textAlign: 'center', color: '#666'}}>
+                                            Gene-level data is not available for this analysis.
                                         </div>
                                     )}
                                 </Card>
@@ -2332,6 +2596,10 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
             content: (
                 <Space direction="vertical" size="large" style={{width: '100%'}}>
                     <Card title="Experimental Context">
+                        {/* A meta-analysis whose sources are not all in this study would otherwise
+                            just produce a shorter dataset list, with nothing saying the report is
+                            being written from less evidence than the meta was computed over. */}
+                        {renderUnresolvedSourcesWarning()}
                         {Object.keys(analysesMetadata).length > 0 ? (
                             <Space direction="vertical" style={{ width: '100%' }} size="middle">
                                 <Text type="secondary">
@@ -2366,7 +2634,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                     })}
                                 </div>
                                 <Text type="secondary" style={{ fontSize: '12px', marginTop: 8 }}>
-                                    This metadata will be used for AI interpretation and validation.
+                                    This metadata will be used for biological interpretation and validation.
                                 </Text>
                             </Space>
                         ) : (
@@ -2375,7 +2643,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                     <InfoCircleOutlined style={{ fontSize: 48, color: '#1890ff', marginBottom: 16 }} />
                                     <Title level={5}>Biological Context Required</Title>
                                     <Text type="secondary">
-                                        AI interpretation requires biological context about your study.
+                                        Interpretation requires biological context about your study.
                                     </Text>
                                 </div>
                                 <Button
@@ -2395,9 +2663,12 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
 
                     <Card title="Analysis Summary">
                         <Space direction="vertical" size="middle" style={{width: '100%'}}>
+                            {/* Shown again here: this is the last screen before the report is
+                                generated, and the shortfall changes what the report is based on. */}
+                            {renderUnresolvedSourcesWarning()}
                             <div>
                                 <Title level={5}>Selected Analyses</Title>
-                                <Text>{selectedAnalyses.filter(id => !id.startsWith('group_')).map(id => analyses[id]?.name || id).join(', ')}</Text>
+                                <Text>{selectedAnalyses.filter(id => !id.startsWith('group_')).map(id => analysisLabel(id)).join(', ')}</Text>
                             </div>
 
                             <div>
@@ -2415,10 +2686,13 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                     <Title level={5}>Selected databases and pathways</Title>
                                     {selectedAnalyses.filter(id => !id.startsWith('group_')).map(analysisId => (
                                         <div key={analysisId} style={{marginBottom: 16}}>
-                                            <Text strong>{analyses[analysisId]?.name}:</Text>
+                                            {/* nonEmptyLabel, not a bare lookup: this used to render
+                                                `<Text strong>{undefined}:</Text>` for a meta-analysis
+                                                — a colon alone on its own line. */}
+                                            <Text strong>{nonEmptyLabel(analysisLabel(analysisId))}:</Text>
                                             {pathwayData[analysisId]?.map(db => (
                                                 <div key={db.database} style={{marginLeft: 24, marginBottom: 8}}>
-                                                    <Text strong>- {db.database}:</Text>{' '}
+                                                    <Text strong>- {nonEmptyLabel(db.database, 'Unnamed database')}:</Text>{' '}
                                                     {renderCollapsibleNameList(
                                                         selectedPathways[analysisId]
                                                             ?.filter(p => p.database === db.database)
@@ -2438,7 +2712,7 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                     {selectedAnalyses.filter(id => !id.startsWith('group_')).map(analysisId => (
                                         genes[analysisId] && (
                                             <div key={analysisId} style={{marginBottom: 8}}>
-                                                <Text strong>{analyses[analysisId]?.name}:</Text>{' '}
+                                                <Text strong>{nonEmptyLabel(analysisLabel(analysisId))}:</Text>{' '}
                                                 {renderCollapsibleNameList(
                                                     selectedGenes[analysisId]?.map(g => g.name),
                                                     'gene'
@@ -2574,6 +2848,8 @@ const AnalysisWizard = ({analyses, metaAnalyses, configs, sessionId, organismId,
                                                     userId={Meteor.userId()}
                                                     sessionId={sessionId}
                                                     onViewInsight={handleViewInsight}
+                                                    analyses={analyses}
+                                                    metaAnalyses={metaAnalyses}
                                                 />
                                             </div>
                                         )

@@ -43,6 +43,9 @@ const FORMAT_SPECS = {
   // columns, optional header, tab or comma. Both flows now share that one parser, so keep
   // the three in sync — tightening one without the others brings back the old asymmetry
   // where a file the wizard happily accepts gets reported as invalid.
+  // When pgseaRequireStatsColumns is on (imports/utils/inputTypePolicy.js), `data.validate`
+  // first applies the parser's own 3-column check and refuses a single-metric file without
+  // consulting this spec, so with the flag on only 3-column files ever reach it.
   pgsea: {
     name: 'PGSEA (Parametric Gene Set Enrichment Analysis)',
     description: 'Delimited file with gene identifiers and one or two numeric ranking columns; header optional',

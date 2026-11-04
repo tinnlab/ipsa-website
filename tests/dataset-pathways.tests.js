@@ -8,11 +8,14 @@
 // type-check against the pipeline's PathwayInput model, so nothing rejected them.
 import assert from "assert";
 import {
+    addRawPathwayKeys,
+    buildPathwaySelection,
     indexGeneSets,
     indexGeneSymbols,
     mapDatasetPathways,
     readPathwayFDR,
     readPathwayId,
+    restrictPathwaysToSelection,
     selectSignificantPathwayIds,
 } from "../imports/utils/datasetPathways";
 
@@ -317,5 +320,89 @@ describe("dataset pathways → interpretation payload", function () {
         it("mapDatasetPathways is callable with no arguments at all", function () {
             assert.deepStrictEqual(mapDatasetPathways().pathways, []);
         });
+    });
+});
+
+// Meta-analysis grounding: per-dataset lists restricted to the user's selection.
+// The two sides prefer different fields: a dataset row's id is `pathway || ID`, while the
+// wizard's selection sets originalId = pathway.ID (meta/consensus paths) or pathway.pathway
+// (another path) and id = `<database>:<that>`.
+describe("dataset pathways restricted to the meta selection", function () {
+    const mapped = (rows) => mapDatasetPathways({rows, source: "KEGG"}).pathways;
+    const restrict = (rows, selected) =>
+        restrictPathwaysToSelection(mapped(rows), addRawPathwayKeys(rows), buildPathwaySelection(selected));
+
+    const ROWS = [
+        {pathway: "path:hsa00010", pValue: 1e-4, pValueFDR: 1e-3, score: 1.2, name: "Glycolysis"},
+        {pathway: "path:hsa00020", pValue: 1e-4, pValueFDR: 1e-3, score: -1.1, name: "TCA cycle"},
+    ];
+
+    it("keeps a pathway whose id matches the selection's originalId", function () {
+        const {kept, matchedById, matchedByName} = restrict(ROWS, [
+            {id: "KEGG:path:hsa00010", originalId: "path:hsa00010", name: "Glycolysis", database: "KEGG"},
+        ]);
+        assert.deepStrictEqual(kept.map(p => p.pathwayId), ["path:hsa00010"]);
+        assert.strictEqual(matchedById, 1);
+        assert.strictEqual(matchedByName, 0);
+    });
+
+    it("matches by id when the row has pathway ≠ ID and the selection used ID", function () {
+        const rows = [{pathway: "kegg-local-10", ID: "path:hsa00010", pValueFDR: 1e-3, name: "x"}];
+        const {kept, matchedById} = restrict(rows, [
+            {id: "KEGG:path:hsa00010", originalId: "path:hsa00010", name: "Renamed", database: "KEGG"},
+        ]);
+        assert.strictEqual(kept.length, 1);
+        assert.strictEqual(kept[0].pathwayId, "kegg-local-10", "the emitted pathwayId is unchanged");
+        assert.strictEqual(matchedById, 1);
+    });
+
+    it("matches by id when the selection's originalId came from pathway.pathway", function () {
+        const rows = [{pathway: "kegg-local-10", ID: "path:hsa00010", pValueFDR: 1e-3, name: "x"}];
+        const {kept, matchedById} = restrict(rows, [
+            {id: "KEGG:kegg-local-10", originalId: "kegg-local-10", name: "Renamed", database: "KEGG"},
+        ]);
+        assert.strictEqual(kept.length, 1);
+        assert.strictEqual(matchedById, 1);
+    });
+
+    it("uses the id suffix only when its prefix is the pathway's database", function () {
+        const sel = (database) => [{id: "KEGG:path:hsa00020", name: "Other name", database}];
+        assert.strictEqual(restrict(ROWS, sel("KEGG")).matchedById, 1);
+        assert.strictEqual(restrict(ROWS, sel("Reactome")).kept.length, 0);
+    });
+
+    it("falls back to a normalised name match", function () {
+        const {kept, matchedById, matchedByName} = restrict(ROWS, [
+            {id: "X:unknown", originalId: "unknown", name: "  tca   CYCLE ", database: "X"},
+        ]);
+        assert.deepStrictEqual(kept.map(p => p.name), ["TCA cycle"]);
+        assert.strictEqual(matchedById, 0);
+        assert.strictEqual(matchedByName, 1);
+    });
+
+    it("does not match on punctuation-stripped names (normalisation stays light)", function () {
+        assert.strictEqual(restrict(ROWS, [{originalId: "u", name: "TCA-cycle"}]).kept.length, 0);
+    });
+
+    it("an empty selection keeps nothing; a non-matching one reports zero matches", function () {
+        assert.deepStrictEqual(restrict(ROWS, []).kept, []);
+        const none = restrict(ROWS, [{originalId: "path:hsa99999", name: "Nope"}]);
+        assert.strictEqual(none.kept.length, 0);
+        assert.strictEqual(none.matchedById + none.matchedByName, 0);
+    });
+
+    it("never mutates its input and keeps the mapped shape", function () {
+        const pathways = mapped(ROWS);
+        const before = JSON.stringify(pathways);
+        const {kept} = restrictPathwaysToSelection(pathways, addRawPathwayKeys(ROWS),
+            buildPathwaySelection([{originalId: "path:hsa00010"}]));
+        assert.strictEqual(JSON.stringify(pathways), before);
+        assert.deepStrictEqual(kept[0], pathways[0]);
+    });
+
+    it("tolerates junk input", function () {
+        assert.deepStrictEqual(restrictPathwaysToSelection(undefined, undefined, undefined).kept, []);
+        assert.strictEqual(buildPathwaySelection(null).ids.size, 0);
+        assert.strictEqual(addRawPathwayKeys(null).size, 0);
     });
 });

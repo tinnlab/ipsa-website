@@ -68,7 +68,7 @@ const MODE_OPTIONS = [
     {
         value: "results",
         label: "Results only",
-        hint: "They get a view-only copy: results and AI reports, no uploaded data, and they cannot re-run or edit it.",
+        hint: "They get a view-only copy: results and biological interpretation reports, no uploaded data, and they cannot re-run or edit it.",
     },
     {
         value: "full",

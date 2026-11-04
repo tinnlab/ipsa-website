@@ -11,9 +11,20 @@ export const SHARE_STATUS = {
 
 // A share is usable only while it is active. Revocation is explicit and wins over the clock, so a
 // revoked link never comes back even if its expiry is later extended.
+//
+// `neverExpires` is the ONE way to express a permanent link, and it is deliberately a flag rather
+// than a null expiry or a far-future sentinel date: the fail-closed rule below has to keep reading a
+// missing or malformed expiry as EXPIRED, so permanence must be STATED and can never be inferred.
+// It is written only by the case-study seeder (server/helper/caseStudies.js); share.create cannot
+// mint one, and MIN/MAX_EXPIRY_DAYS still bound every user-created link.
+//
+// Checked AFTER revokedAt: revocation is the owner's kill switch and must win over everything,
+// permanence included, or a case study could never be taken down. Strict `=== true`, so a stray
+// truthy value in a hand-edited document cannot silently confer immortality.
 export const shareStatus = (share, nowMs) => {
     if (!share) return SHARE_STATUS.REVOKED;
     if (share.revokedAt) return SHARE_STATUS.REVOKED;
+    if (share.neverExpires === true) return SHARE_STATUS.ACTIVE;
     const expiresMs = share.expiresAt ? new Date(share.expiresAt).getTime() : NaN;
     // A share with no usable expiry is treated as expired rather than eternal — failing closed.
     if (!Number.isFinite(expiresMs)) return SHARE_STATUS.EXPIRED;
@@ -35,9 +46,14 @@ export const isValidExpiryDays = (days) =>
 export const expiryFromDays = (days, nowMs) => new Date(nowMs + days * DAY_MS);
 
 // Human-readable remaining time for the owner's list of links.
+export const NEVER_EXPIRES_LABEL = 'Never';
+
 export const formatExpiresIn = (share, nowMs) => {
     const status = shareStatus(share, nowMs);
     if (status !== SHARE_STATUS.ACTIVE) return status;
+    // A permanent share reaches here with no expiresAt to subtract from, which would make every
+    // branch below NaN and render "NaN minutes". It has no remaining time to report — say so.
+    if (share.neverExpires === true) return NEVER_EXPIRES_LABEL;
     const remaining = new Date(share.expiresAt).getTime() - nowMs;
     const days = Math.floor(remaining / DAY_MS);
     if (days >= 1) return `${days} day${days === 1 ? '' : 's'}`;
@@ -51,3 +67,16 @@ export const formatExpiresIn = (share, nowMs) => {
 // behind the deployment's path prefix.
 export const shareUrl = (shareId, origin, urlPrefix = '') =>
     `${origin}${urlPrefix || ''}/import/${shareId}`;
+
+// True when a 'full' import produced a study with no input files.
+//
+// cloneStudy's copyUploadDir reads from tempUploadDir/<DONOR userId>/<sessionId> and its readdir
+// catch returns {copied: 0} for ANY error, so the import "succeeds" and hands the recipient a study
+// that can be viewed but never re-run. That is not hypothetical: a workspace recovery transfers
+// Session.userId without moving files, leaving the donor's uploads under the previous owner's path.
+//
+// 'results' mode copies no inputs BY DESIGN, so it is never a loss. Strict `=== 0` so an absent
+// count (an older server, a failed call) reads as "unknown", not as "lost" — only a full clone that
+// actually reported zero files warns.
+export const fullImportLostInputs = (mode, counts) =>
+    mode === 'full' && counts?.files === 0;

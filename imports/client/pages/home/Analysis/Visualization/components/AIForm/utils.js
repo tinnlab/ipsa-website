@@ -9,70 +9,12 @@ import { normalizeMermaidCode } from '/imports/utils/mermaidCode';
 
 const { Text } = Typography;
 
-// Helper function to create URL-friendly slugs from heading text
-export const slugify = (text) => {
-    if (!text) return '';
-    return String(text)
-        .toLowerCase()
-        .trim()
-        .replace(/\s+/g, '-')           // Replace spaces with -
-        .replace(/[^\w\-]+/g, '')       // Remove non-word chars
-        .replace(/\-\-+/g, '-')         // Replace multiple - with single -
-        .replace(/^-+/, '')             // Trim - from start
-        .replace(/-+$/, '');            // Trim - from end
-};
-
-// Helper function to extract headings from markdown content
-export const extractMarkdownHeadings = (markdownContent) => {
-    if (!markdownContent) return [];
-
-    const headingRegex = /^(#{1,6})\s+(.+)$/gm;
-    const headings = [];
-    let match;
-
-    while ((match = headingRegex.exec(markdownContent)) !== null) {
-        const level = match[1].length; // Number of # characters
-        const text = match[2].trim();
-        const id = slugify(text);
-
-        headings.push({
-            level,
-            text,
-            id
-        });
-    }
-
-    return headings;
-};
-
-// Helper function to build hierarchical TOC structure
-export const buildTOCHierarchy = (headings) => {
-    if (!headings || headings.length === 0) return [];
-
-    const result = [];
-    const stack = [];
-
-    headings.forEach(heading => {
-        const node = { ...heading, children: [] };
-
-        // Find the parent for this heading
-        while (stack.length > 0 && stack[stack.length - 1].level >= heading.level) {
-            stack.pop();
-        }
-
-        if (stack.length === 0) {
-            // Top-level heading
-            result.push(node);
-        } else {
-            // Nested heading
-            stack[stack.length - 1].children.push(node);
-        }
-
-        stack.push(node);
-    });
-
-    return result;
-};
+// slugify / extractMarkdownHeadings / buildTOCHierarchy moved to /imports/utils/markdownHeadings so
+// the report's table-of-contents rules can be exercised by the server-side test runner, which cannot
+// load this module (React, antd, react-markdown, mermaid). Re-exported here because both this file's
+// own components and InsightComponents import them from this path.
+export { slugify, extractMarkdownHeadings, buildTOCHierarchy } from '/imports/utils/markdownHeadings';
+import { namespacedHeadingId } from '/imports/utils/markdownHeadings';
 
 // Helper functions for processing references
 export const extractPaperIds = (text) => {
@@ -207,7 +149,11 @@ const MermaidDiagram = ({ chart }) => {
     );
 };
 
-export const MarkdownWithReferences = ({ content, references, referenceMapping, onReferenceClick, collapsible = true }) => {
+// `idPrefix` namespaces every heading id this renderer emits. The report body stacks all of a
+// batch's templates on one page and legacy batches repeat heading titles across them, so without a
+// prefix two "Methods" headings share a DOM id and a contents-list click on the second scrolls to the
+// first. Defaults to '' — a lone document keeps the bare slugs it always had.
+export const MarkdownWithReferences = ({ content, references, referenceMapping, onReferenceClick, collapsible = true, idPrefix = '' }) => {
     const [collapsedSections, setCollapsedSections] = useState({});
 
     // Split content into sections by H2 headings
@@ -230,7 +176,7 @@ export const MarkdownWithReferences = ({ content, references, referenceMapping, 
                 currentSection = {
                     title,
                     content: [],
-                    id: slugify(title)
+                    id: namespacedHeadingId(idPrefix, title)
                 };
             } else {
                 currentSection.content.push(line);
@@ -243,7 +189,7 @@ export const MarkdownWithReferences = ({ content, references, referenceMapping, 
         }
 
         return result;
-    }, [content]);
+    }, [content, idPrefix]);
 
     const toggleSection = (sectionId) => {
         setCollapsedSections(prev => ({
@@ -338,30 +284,30 @@ export const MarkdownWithReferences = ({ content, references, referenceMapping, 
         },
         // Add IDs to headings for navigation
         h1: ({children, ...props}) => {
-            const id = slugify(String(children));
+            const id = namespacedHeadingId(idPrefix, String(children));
             return <h1 id={id} style={{scrollMarginTop: '100px'}} {...props}>{children}</h1>;
         },
         h2: ({children, ...props}) => {
-            const id = slugify(String(children));
+            const id = namespacedHeadingId(idPrefix, String(children));
             return <h2 id={id} style={{scrollMarginTop: '100px'}} {...props}>{children}</h2>;
         },
         h3: ({children, ...props}) => {
-            const id = slugify(String(children));
+            const id = namespacedHeadingId(idPrefix, String(children));
             return <h3 id={id} style={{scrollMarginTop: '100px'}} {...props}>{children}</h3>;
         },
         h4: ({children, ...props}) => {
-            const id = slugify(String(children));
+            const id = namespacedHeadingId(idPrefix, String(children));
             return <h4 id={id} style={{scrollMarginTop: '100px'}} {...props}>{children}</h4>;
         },
         h5: ({children, ...props}) => {
-            const id = slugify(String(children));
+            const id = namespacedHeadingId(idPrefix, String(children));
             return <h5 id={id} style={{scrollMarginTop: '100px'}} {...props}>{children}</h5>;
         },
         h6: ({children, ...props}) => {
-            const id = slugify(String(children));
+            const id = namespacedHeadingId(idPrefix, String(children));
             return <h6 id={id} style={{scrollMarginTop: '100px'}} {...props}>{children}</h6>;
         },
-    }), [references, onReferenceClick]);
+    }), [references, onReferenceClick, idPrefix]);
 
     if (!content) {
         return <div>No content available</div>;

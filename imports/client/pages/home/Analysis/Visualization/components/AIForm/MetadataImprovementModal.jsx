@@ -128,7 +128,7 @@ export default function MetadataImprovementModal({
             title={
                 <Space>
                     <WarningOutlined style={{ color: '#faad14' }} />
-                    <span>Metadata Needed for AI Interpretation</span>
+                    <span>Metadata Needed for Biological Interpretation</span>
                 </Space>
             }
             open={visible}

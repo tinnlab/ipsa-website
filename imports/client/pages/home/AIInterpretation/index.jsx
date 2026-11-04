@@ -4,7 +4,7 @@ import { Meteor } from 'meteor/meteor';
 import { useTracker } from 'meteor/react-meteor-data';
 import {
     Layout, Card, Tree, Button, Space, Typography, Spin, Empty,
-    Tag, Divider, Badge, Alert, Modal, Input
+    Tag, Divider, Badge, Alert, Modal, Input, Tooltip
 } from 'antd';
 import {
     FolderOutlined, FileTextOutlined, ExperimentOutlined,
@@ -16,7 +16,11 @@ import { Helmet } from 'react-helmet';
 import { InsightViewer, InsightList } from '../Analysis/Visualization/components/AIForm/InsightComponents';
 import AnalysisWizard from '../Analysis/Visualization/components/AIForm/AnalysisWizard';
 import { GlobalSettingsProvider } from '../../../contexts/GlobalSettingsContext';
-import { resolveTreeSelection, initialSelectedAnalysesFor, resolveDeepLinkSelection, analysisNameInStudy } from '../../../../utils/aiInterpretationSelection';
+import useInputTypePolicy from '/imports/client/hooks/useInputTypePolicy';
+import { isInputTypeBlocked, isInterpretationBlocked, INTERPRETATION_BLOCKED_REASON } from '/imports/utils/inputTypePolicy';
+import { resolveTreeSelection, initialSelectedAnalysesFor, resolveDeepLinkSelection, analysisNameInStudy,
+    parseAIInterpretationLink, buildAIInterpretationLink, selectionKeyFromSearch,
+    resolveDeepLinkReport } from '../../../../utils/aiInterpretationSelection';
 import { batchesForSelection, groupBatchesByAnalysis, isReadOnlyStudy } from '../../../../utils/aiInterpretationReports';
 
 const { Title, Text } = Typography;
@@ -25,14 +29,25 @@ const { Content, Sider } = Layout;
 export default function AIInterpretation() {
     const navigate = useNavigate();
     const location = useLocation();
-    const deepLinkAppliedRef = useRef(false);
+    // The selection currently reflected in the URL. This used to be a once-only boolean, which
+    // consumed the link forever: Back and Forward moved the address bar and nothing else. Keyed on
+    // the SELECTION part of the query, it re-applies whenever the user really does navigate between
+    // selections, and stays quiet when only reportId moves — i.e. when a report opens or closes.
+    const appliedSelectionRef = useRef(null);
+    // Ref, not state: this only exists to keep one toast from firing on every re-render while a
+    // dead link is on screen, and it must not itself cause a render.
+    const missingReportNotifiedRef = useRef(null);
     const [loading, setLoading] = useState(true);
+    // Latches true after the first batch fetch settles, success or failure, and never goes back.
+    // `loading` cannot serve here: it turns on again for every manual refresh, which would tear the
+    // open report down and re-show a spinner. Distinguishing "not loaded yet" from "loaded and
+    // empty" is what stops a pasted link flashing "report not found" before the fetch lands.
+    const [batchesLoaded, setBatchesLoaded] = useState(false);
     const [studies, setStudies] = useState([]);
     const [batches, setBatches] = useState([]);
     const [studyMetaAnalyses, setStudyMetaAnalyses] = useState({});
     const [selectedKeys, setSelectedKeys] = useState([]);
     const [expandedKeys, setExpandedKeys] = useState([]);
-    const [selectedBatchId, setSelectedBatchId] = useState(null);
     const [selectedAnalysis, setSelectedAnalysis] = useState(null);
     // The page has one hierarchy: overview -> the selection's reports -> (only on request) the
     // generator. Selecting something used to mount the wizard immediately, so the user was thrown
@@ -79,21 +94,40 @@ export default function AIInterpretation() {
 
     // Arriving by link should open exactly what clicking the same thing in the sidebar opens:
     // ?sessionId= alone selects the study, ?sessionId=&analysisId= selects that analysis. Both land
-    // on that selection's REPORTS, like a click. Ref-guarded so it runs once, only after the studies
-    // have loaded, and never overrides a later click of the user's own.
+    // on that selection's REPORTS, like a click.
+    //
+    // Guarded on the SELECTION part of the query rather than on a once-only flag. The old boolean
+    // consumed the URL for the lifetime of the mount, so browser Back and Forward moved the address
+    // bar and left the page untouched; keyed this way, a real move between selections is honoured,
+    // while opening a report — which only appends &reportId= — leaves the selection, the sidebar and
+    // the wizard exactly as they were.
+    //
+    // The old setSelectedBatchId(null) is gone with it. Which report is open is read off the URL
+    // now, so clearing it a millisecond after applying the link is precisely what used to make a
+    // link to a report impossible.
     useEffect(() => {
-        if (deepLinkAppliedRef.current || studies.length === 0) return;
-        deepLinkAppliedRef.current = true; // consume the link even if it does not resolve
+        if (studies.length === 0) return;
+
+        const key = selectionKeyFromSearch(location.search);
+        if (appliedSelectionRef.current === key) return;
+        appliedSelectionRef.current = key;
 
         const selection = resolveDeepLinkSelection(location.search, studies);
-        if (!selection) return;
+        if (!selection) {
+            // No sessionId, or one naming a study that is not ours, means the overview — which is
+            // also where Back out of a selection has to land.
+            setSelectedAnalysis(null);
+            setSelectedKeys([]);
+            setGenerating(false);
+            setWizardData(null);
+            return;
+        }
 
         setSelectedAnalysis(selection);
         // Select the same tree key the equivalent click would have selected, so the sidebar
         // highlights the analysis — not merely its study — when the link named one.
         setSelectedKeys([selection.analysisId ? `${selection.sessionId}|${selection.analysisId}` : selection.sessionId]);
         setExpandedKeys(prev => prev.includes(selection.sessionId) ? prev : [...prev, selection.sessionId]);
-        setSelectedBatchId(null);
         setGenerating(false);
         setWizardData(null);
     }, [studies, location.search]);
@@ -112,6 +146,9 @@ export default function AIInterpretation() {
                 notify.error('Failed to load reports');
             } finally {
                 setLoading(false);
+                // Settled, even if it failed: an empty list is an answer, not a wait. Anything that
+                // asks "is this reportId real?" needs to know the difference.
+                setBatchesLoaded(true);
             }
         };
 
@@ -223,6 +260,25 @@ export default function AIInterpretation() {
         [studies, selectedAnalysis]
     );
 
+    // Biological Interpretation gating by input type (imports/utils/inputTypePolicy.js). The
+    // wizard's analysis picker also disables analyses with no gene-level results, and the server
+    // refuses both cases regardless.
+    const { interpretationBlockedInputTypes } = useInputTypePolicy();
+    const generateBlockedReason = useMemo(() => {
+        if (!selectedAnalysis || !selectedStudy) return null;
+        const studyAnalyses = selectedStudy.analyses || [];
+        if (selectedAnalysis.analysisId) {
+            const analysis = studyAnalyses.find(a => a.id === selectedAnalysis.analysisId);
+            return analysis && isInputTypeBlocked(analysis.input, interpretationBlockedInputTypes)
+                ? INTERPRETATION_BLOCKED_REASON
+                : null;
+        }
+        const hasMeta = (selectedStudy.metaAnalyses || []).length > 0;
+        return !hasMeta && isInterpretationBlocked(studyAnalyses.map(a => a.input), interpretationBlockedInputTypes)
+            ? 'Every analysis in this study is of an input type with no gene-level statistics, so hypothesis generation cannot be grounded.'
+            : null;
+    }, [selectedAnalysis, selectedStudy, interpretationBlockedInputTypes]);
+
     const selectionReportGroups = useMemo(
         () => groupBatchesByAnalysis(batchesForSelection(batches, selectedAnalysis), selectedStudy),
         [batches, selectedAnalysis, selectedStudy]
@@ -237,6 +293,17 @@ export default function AIInterpretation() {
     // refused server-side, so they are not offered. Resolved per study because this page shows
     // several at once (the overview spans all of them).
     const selectionReadOnly = isReadOnlyStudy(studies, selectedAnalysis?.sessionId);
+
+    // Which report is open is a property of the URL, not of this component. That is the whole point:
+    // refresh, a pasted link, Back and Forward all read the same source and therefore cannot
+    // disagree, with no reconciliation logic to get wrong. It used to be React state, so a refresh
+    // dropped the reader back to the list and a report had no address to share at all.
+    const link = useMemo(() => parseAIInterpretationLink(location.search), [location.search]);
+    const reportLink = useMemo(
+        () => resolveDeepLinkReport(location.search, batches, batchesLoaded),
+        [location.search, batches, batchesLoaded]
+    );
+    const selectedBatchId = reportLink.status === 'ok' ? reportLink.batchId : null;
 
     // Group all batches by study for overview display
     const batchesGroupedByStudy = useMemo(() => {
@@ -254,9 +321,12 @@ export default function AIInterpretation() {
                 };
             }
 
-            // Find analysis name
-            const analysis = study.analyses?.find(a => a.id === batch.analysisId);
-            const analysisName = analysis?.name || batch.analysisName || 'Unknown Analysis';
+            // Find analysis name. analysisNameInStudy also looks in metaAnalyses[]; searching only
+            // analyses[] left every meta-analysis report falling back to the name stored on the
+            // batch, which is where "Analysis <id>" came from. Same resolution groupBatchesByAnalysis
+            // already uses, so the two report lists on this page agree.
+            const analysisName = analysisNameInStudy(study, batch.analysisId)
+                || batch.analysisName || 'Unknown Analysis';
 
             if (!grouped[study._id].analyses[batch.analysisId]) {
                 grouped[study._id].analyses[batch.analysisId] = {
@@ -286,9 +356,24 @@ export default function AIInterpretation() {
         // pre-selected; an analysis key pre-selects that analysis. (See aiInterpretationSelection.)
         const selection = resolveTreeSelection(keys[0], info.node);
         if (!selection) return;
+
+        // Mirror the click into the URL, so the selection survives a refresh and so closing a report
+        // has a truthful place to return to. `replace`: browsing the tree created no history entries
+        // before and should not start now — Back from a selection still leaves the page.
+        const search = buildAIInterpretationLink({
+            sessionId: selection.sessionId,
+            analysisId: selection.analysisId
+        });
+        // This click IS the URL's meaning, so record it as already applied. Without this the effect
+        // above would re-derive the selection from the study document, and for a meta-analysis node
+        // — whose name comes from visualization.getMetaAnalyses, not necessarily from
+        // Session.metaAnalyses — that can resolve one notch coarser and silently demote the user's
+        // pick to its study.
+        appliedSelectionRef.current = selectionKeyFromSearch(search);
+        navigate({ search }, { replace: true });
+
         setSelectedAnalysis(selection);
         setSelectedKeys(keys);
-        setSelectedBatchId(null);
         setGenerating(false); // a click shows what exists; it never opens the generator
         setWizardData(null); // Clear previous wizard data
     };
@@ -353,6 +438,8 @@ export default function AIInterpretation() {
     // Back navigation, one level at a time. The generator returns to the reports of the selection
     // it was opened from — never straight to the overview, which would lose the user's place.
     const handleBackToOverview = () => {
+        navigate({ search: '' }, { replace: true }); // the URL must stop claiming a selection
+        appliedSelectionRef.current = selectionKeyFromSearch('');
         setSelectedAnalysis(null);
         setSelectedKeys([]);
         setGenerating(false);
@@ -370,8 +457,24 @@ export default function AIInterpretation() {
         handleRefresh();
     };
 
+    // Opening a report pushes ONE history entry and stamps it as ours.
+    //
+    // The study id rides along so a cold load of this URL can scope the page without a second
+    // lookup. The analysis id is the SELECTION's, not the batch's, so closing restores the list the
+    // user was actually looking at — a study-wide list stays study-wide. Opened from the overview
+    // there is no selection, so the batch itself supplies the study.
     const handleViewReport = (batchId) => {
-        setSelectedBatchId(batchId);
+        const batch = batches.find(b => b._id === batchId);
+        navigate(
+            {
+                search: buildAIInterpretationLink({
+                    sessionId: selectedAnalysis?.sessionId || batch?.sessionId,
+                    analysisId: selectedAnalysis?.analysisId,
+                    reportId: batchId
+                })
+            },
+            { state: { fromList: true } }
+        );
     };
 
     const handleDeleteReport = (batch) => {
@@ -384,7 +487,8 @@ export default function AIInterpretation() {
                 try {
                     await Meteor.callAsync('queue.removeBatch', batch._id);
                     notify.success('Report deleted');
-                    if (selectedBatchId === batch._id) setSelectedBatchId(null);
+                    // Replace, not push: the deleted report's URL must not survive one Back away.
+                    if (selectedBatchId === batch._id) closeReport({ force: true });
                     await handleRefresh();
                 } catch (error) {
                     notify.error(error.reason || 'Failed to delete report');
@@ -413,9 +517,48 @@ export default function AIInterpretation() {
         }
     };
 
-    const handleBackToList = () => {
-        setSelectedBatchId(null);
+    // Closing a report costs one action, never two, and never strands the user.
+    //
+    // `fromList` means the entry underneath this one is this page's own list, so popping it restores
+    // that list exactly as it was — overview vs selection, scroll position, an open wizard. A
+    // rebuilt URL cannot know any of that, which is why the pop is preferred wherever it exists.
+    //
+    // A pasted link, or one arrived at from the Visualization page, has no such entry: what sits
+    // underneath is another page or another site. navigate(-1) would eject the user out of the app,
+    // and pushing the list would make Back re-open the report they just closed — the classic trap.
+    // So the report entry is REPLACED by its study's list instead. `force` skips the pop for a
+    // report that has just been deleted, where going back to it would be going back to nothing.
+    const closeReport = ({ force = false } = {}) => {
+        if (location.state?.fromList && !force) {
+            navigate(-1);
+            return;
+        }
+        navigate(
+            {
+                search: buildAIInterpretationLink({
+                    sessionId: link.sessionId,
+                    analysisId: link.analysisId
+                })
+            },
+            { replace: true }
+        );
     };
+
+    const handleBackToList = () => closeReport();
+
+    // A reportId that is not in this user's own batch list is stale, deleted, or someone else's.
+    // Mounting the viewer for it would fetch twice, be refused twice, and leave a titled shell with
+    // no content — a convincing-looking view of nothing. Say so once, drop the id, and keep the
+    // study so the fallback is that study's reports rather than a blank overview. Replace, so Back
+    // does not walk straight back into the dead link.
+    useEffect(() => {
+        if (reportLink.status !== 'unknown') return;
+        if (missingReportNotifiedRef.current === reportLink.batchId) return;
+        missingReportNotifiedRef.current = reportLink.batchId;
+
+        notify.error('That report is no longer available. It may have been deleted, or the link may belong to another account.');
+        closeReport({ force: true });
+    }, [reportLink.status, reportLink.batchId]);
 
     const handleRefresh = async () => {
         if (!user?._id) return;
@@ -428,6 +571,7 @@ export default function AIInterpretation() {
             console.error('Error refreshing batches:', error);
         } finally {
             setLoading(false);
+            setBatchesLoaded(true); // same latch as the initial fetch; see its comment
         }
     };
 
@@ -452,22 +596,40 @@ export default function AIInterpretation() {
         return new Date(date).toLocaleString();
     };
 
+    // The URL names a report but the batch list has not landed yet. Rendering the list here would
+    // flash the wrong screen at anyone opening a link; rendering "not found" would be a lie. The
+    // wait is bounded — both fetches mark the list loaded in their `finally`, success or failure.
+    if (reportLink.status === 'pending') {
+        return (
+            <Layout style={{ minHeight: 'calc(100vh - 70px - 60px)', background: '#f5f5f5' }}>
+                <Helmet title="Biological Interpretation - IPSA Platform" />
+                <Content style={{ padding: '24px', textAlign: 'center' }}>
+                    <div style={{ padding: '60px' }}>
+                        <Spin size="large" />
+                        <div style={{ marginTop: 16 }}><Text>Opening report...</Text></div>
+                    </div>
+                </Content>
+            </Layout>
+        );
+    }
+
     // Show InsightViewer if a batch is selected. Full-width, no sidebar — that is the whole point
     // of routing "View" up to this page instead of the wizard's internal viewer.
     if (selectedBatchId) {
-        // Name the report from THIS page's batch list rather than leaving the viewer to work it
-        // out: this copy is reloaded after every rename, so the header cannot show a stale name.
-        const viewedBatch = batches.find(b => b._id === selectedBatchId);
+        // The row resolveDeepLinkReport already matched, rather than a second lookup that could
+        // disagree with it. Naming the report from THIS page's list is what keeps the header correct
+        // after a rename: this copy is reloaded, the viewer's own fetch is not.
+        const viewedBatch = reportLink.batch;
         const viewedStudy = studies.find(s => s._id === viewedBatch?.sessionId);
         return (
             <GlobalSettingsProvider>
                 <Layout style={{ minHeight: 'calc(100vh - 70px - 60px)', background: '#f5f5f5' }}>
-                    <Helmet title="AI Report - IPSA Platform" />
+                    <Helmet title="Biological Interpretation - IPSA Platform" />
                     <Content style={{ padding: '24px' }}>
                         <InsightViewer
                             batchId={selectedBatchId}
                             onClose={handleBackToList}
-                            setView={() => setSelectedBatchId(null)}
+                            setView={handleBackToList}
                             setSelectedInsight={() => {}}
                             studyName={viewedStudy?.name}
                             analysisName={analysisNameInStudy(viewedStudy, viewedBatch?.analysisId) || viewedBatch?.analysisName}
@@ -481,7 +643,7 @@ export default function AIInterpretation() {
 
     return (
         <Layout style={{ minHeight: 'calc(100vh - 70px - 60px)', background: '#f5f5f5' }}>
-            <Helmet title="AI-interpretation - IPSA Platform" />
+            <Helmet title="Biological Interpretation - IPSA Platform" />
 
             {/* Rename-report modal */}
             <Modal
@@ -576,12 +738,12 @@ export default function AIInterpretation() {
                 <Content style={{ padding: '24px', width: '100%' }}>
                     <Card>
                         <Title level={3} style={{ marginBottom: 16 }}>
-                            AI-interpretation
+                            Biological Interpretation
                         </Title>
 
                         <Alert
-                            message="AI-Powered Pathway Analysis Reports"
-                            description="Reports are organised by study and analysis. Select a study or an analysis on the left to see its reports and generate a new one. Reports include pathway analysis, gene insights, and publication-ready summaries."
+                            message="Pathway Analysis Reports"
+                            description="Reports are organised by study and analysis. Select a study or an analysis on the left to see its reports and generate a new one. Reports include pathway analysis and gene insights."
                             type="info"
                             showIcon
                             style={{ marginBottom: 24 }}
@@ -600,7 +762,7 @@ export default function AIInterpretation() {
 
                                 {batchesGroupedByStudy.length === 0 ? (
                                     <Empty
-                                        description="No AI reports generated yet. Select a study or an analysis on the left to see its reports and generate your first one."
+                                        description="No reports generated yet. Select a study or an analysis on the left to see its reports and generate your first one."
                                         image={Empty.PRESENTED_IMAGE_SIMPLE}
                                     />
                                 ) : (
@@ -677,15 +839,27 @@ export default function AIInterpretation() {
                                         {/* Generating writes a report into the study, which a
                                             view-only import rejects server-side. */}
                                         {!selectionReadOnly && (
-                                            <Button
-                                                type="primary"
-                                                icon={<PlusOutlined />}
-                                                onClick={handleGenerateNewInsight}
-                                            >
-                                                Generate new insight
-                                            </Button>
+                                            <Tooltip title={generateBlockedReason || ''}>
+                                                <Button
+                                                    type="primary"
+                                                    icon={<PlusOutlined />}
+                                                    onClick={handleGenerateNewInsight}
+                                                    disabled={Boolean(generateBlockedReason)}
+                                                >
+                                                    Generate new insight
+                                                </Button>
+                                            </Tooltip>
                                         )}
                                     </div>
+                                    {!selectionReadOnly && generateBlockedReason && (
+                                        <Alert
+                                            type="info"
+                                            showIcon
+                                            style={{ marginTop: 12 }}
+                                            message="Biological Interpretation is not available here"
+                                            description={generateBlockedReason}
+                                        />
+                                    )}
                                 </div>
 
                                 <Divider orientation="left">
@@ -761,7 +935,7 @@ export default function AIInterpretation() {
                                             configs={wizardData.configs}
                                             organismId={wizardData.organismId}
                                             initialView="wizard"
-                                            onViewInsight={setSelectedBatchId}
+                                            onViewInsight={handleViewReport}
                                             // Every exit from the wizard — its "Back to Insights"
                                             // button and the hand-off once a report finishes —
                                             // returns to the reports above, which then refresh so
