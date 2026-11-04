@@ -23,6 +23,10 @@ import {
     formatDaysLeft,
     isScratchStale,
     isReapableScratchName,
+    studyStatusLabel,
+    STUDY_STATUS_EXPIRED,
+    STUDY_STATUS_VIEW_ONLY,
+    STUDY_STATUS_ACTIVE,
 } from "../server/helper/retention";
 import {
     purgeStaleSessionUploads,
@@ -443,6 +447,11 @@ describe("data retention — runner (cron-job.js, fs + injected DB)", function (
                     const dv = d[k] instanceof Date ? d[k].getTime() : new Date(d[k]).getTime();
                     const lv = v.$lt instanceof Date ? v.$lt.getTime() : new Date(v.$lt).getTime();
                     if (!(Number.isFinite(dv) && dv < lv)) return false;
+                } else if (v && typeof v === "object" && "$ne" in v) {
+                    // Mongo's $ne matches docs where the field is ABSENT as well as docs holding a
+                    // different value — which is the whole point of {permanent: {$ne: true}}, since
+                    // every ordinary study simply has no `permanent` field.
+                    if (d[k] === v.$ne) return false;
                 } else if (d[k] !== v) return false;
             }
             return true;
@@ -472,7 +481,14 @@ describe("data retention — runner (cron-job.js, fs + injected DB)", function (
             async updateAsync(sel = {}, modifier = {}) {
                 let n = 0;
                 for (const d of store) {
-                    if (matches(d, sel)) { if (modifier.$set) Object.assign(d, modifier.$set); n += 1; }
+                    if (matches(d, sel)) {
+                        if (modifier.$set) Object.assign(d, modifier.$set);
+                        // $unset must genuinely DELETE the key, not set it to undefined: the
+                        // permanence tests turn on a field being absent, and `"expiredAt" in doc`
+                        // would still be true if we only assigned undefined.
+                        if (modifier.$unset) for (const k of Object.keys(modifier.$unset)) delete d[k];
+                        n += 1;
+                    }
                 }
                 return n;
             },
@@ -1049,6 +1065,75 @@ describe("data retention — runner (cron-job.js, fs + injected DB)", function (
         assert.strictEqual(second.updated, 0);
     });
 
+    // A "permanent" study is a seeded case study (server/helper/caseStudies.js): flagged, and with
+    // its expiredAt cleared. Both halves matter, and each of the three paths below would otherwise
+    // quietly undo it.
+    describe("permanent studies are exempt from every expiry path", function () {
+        it("the sweep does not delete a permanent study, even with an expiredAt in the past", async function () {
+            const now = 3_000_000_000_000;
+            const Session = makeColl([
+                { _id: "caseStudy", userId: "u1", permanent: true, expiredAt: new Date(now - 10 * DAY), analyses: [{ id: "aCase" }] },
+                { _id: "ordinary", userId: "u1", expiredAt: new Date(now - 10 * DAY), analyses: [{ id: "aOrd" }] },
+            ]);
+            const collections = { Session, AnalysisLog: makeColl([]), AnalysisConfig: makeColl([]) };
+
+            const res = await deleteExpiredStudies({
+                nowMs: now,
+                tempUploadDir: path.join(root, "tmp-upload-perm"),
+                Sessions: Session,
+                AnalysisLog: collections.AnalysisLog,
+                collections,
+            });
+
+            assert.strictEqual(res.deleted, 1, "only the ordinary study is deleted");
+            const ids = Session._store.map((s) => s._id);
+            assert.ok(ids.includes("caseStudy"), "the permanent study survives");
+            assert.ok(!ids.includes("ordinary"), "the ordinary expired study is gone");
+        });
+
+        // The regression that matters most. backfilledExpiry reads a MISSING expiredAt as a legacy
+        // short expiry (cur is NaN, so the "already a full window" test cannot fire) and returns a
+        // fresh date. This runs on every boot over every session, so without the guard a case study
+        // would be re-stamped at each restart and eventually swept.
+        it("the boot-time backfill does not re-stamp expiredAt on a permanent study", async function () {
+            const now = 3_000_000_000_000;
+            const Sessions = makeColl([
+                { _id: "caseStudy", createdAt: new Date(now - 200 * DAY), permanent: true },
+                { _id: "legacy", createdAt: new Date(now - 200 * DAY), expiredAt: new Date(now - 186 * DAY) },
+            ]);
+
+            const res = await backfillLegacyExpiry({ Sessions, nowMs: now });
+
+            assert.strictEqual(res.updated, 1, "only the legacy study is backfilled");
+            const caseStudy = Sessions._store.find((s) => s._id === "caseStudy");
+            assert.ok(!("expiredAt" in caseStudy), "the permanent study still has NO expiredAt");
+            assert.ok(Sessions._store.find((s) => s._id === "legacy").expiredAt, "the legacy one was re-stamped");
+        });
+
+        // The Extend button is deliberately never disabled in the UI, so without this the case
+        // study's own owner is one click away from stamping a real expiry onto it.
+        it("extendStudy is a no-op on a permanent study", async function () {
+            const collections = {
+                Session: makeColl([{ _id: "caseStudy", userId: "u1", permanent: true }]),
+            };
+
+            const result = await extendStudy({ sessionId: "caseStudy", requesterUserId: "u1", collections });
+
+            assert.strictEqual(result, null, "reports that there was nothing to extend");
+            assert.ok(
+                !("expiredAt" in collections.Session._store[0]),
+                "no expiredAt was written"
+            );
+        });
+
+        it("extendStudy still works normally on an ordinary study", async function () {
+            const base = 2_000_000_000_000;
+            const collections = { Session: makeColl([{ _id: "s1", userId: "u1", expiredAt: new Date(base) }]) };
+            const result = await extendStudy({ sessionId: "s1", requesterUserId: "u1", collections });
+            assert.strictEqual(result.getTime(), base + daysToMs(SESSION_EXPIRY_DAYS));
+        });
+    });
+
     it("reapTempScratch deletes old rEval scratch but keeps recent scratch AND reference caches", async function () {
         const tempDir = path.join(root, "tmp");
         const oldScratch = "ziMz2nZ7nuYduPRm6.R";      // 17-char id + .R, old → reap
@@ -1070,5 +1155,55 @@ describe("data retention — runner (cron-job.js, fs + injected DB)", function (
         assert.strictEqual(fs.existsSync(path.join(tempDir, recentScratch)), true, "recent scratch kept");
         assert.strictEqual(fs.existsSync(path.join(tempDir, cacheGz)), true, "reference cache kept");
         assert.strictEqual(fs.existsSync(path.join(tempDir, cacheRds)), true, "rds handoff kept");
+    });
+});
+
+// The Status label the Recent Studies list shows (RecentSessions/index.jsx) and the share-link
+// landing page's prior-imports table BOTH render through this, so a study cannot read one way in
+// one view and another way in the other. Pure.
+describe("studyStatusLabel (one Status rule for both study tables)", function () {
+    const NOW = new Date("2026-01-15T12:00:00Z").getTime();
+    // Real shapes: an ordinary study (server/api/methods/analysis.js session.create) and a
+    // 'results'-mode import, which cloneStudy stamps readOnly (server/helper/cloneStudy.js:192-193).
+    const ACTIVE_STUDY = {status: "Active", expiredAt: new Date(NOW + 30 * 24 * 60 * 60 * 1000)};
+    const VIEW_ONLY_IMPORT = {...ACTIVE_STUDY, readOnly: true, editable: false};
+
+    it("reports an unexpired study by its stored status", function () {
+        assert.strictEqual(studyStatusLabel(ACTIVE_STUDY, NOW), STUDY_STATUS_ACTIVE);
+    });
+
+    it("says view-only for a results-mode import", function () {
+        assert.strictEqual(studyStatusLabel(VIEW_ONLY_IMPORT, NOW), STUDY_STATUS_VIEW_ONLY);
+    });
+
+    // Expiry is the signal the nightly sweep deletes on, so it has to beat both the view-only marker
+    // and the stored status — which is written "Active" at creation and never changed, and would
+    // otherwise label a study that is about to be deleted as healthy.
+    it("reports expiry ahead of view-only and ahead of the stored status", function () {
+        const expired = {expiredAt: new Date(NOW - 1)};
+        assert.strictEqual(studyStatusLabel(expired, NOW), STUDY_STATUS_EXPIRED);
+        assert.strictEqual(studyStatusLabel({...expired, readOnly: true}, NOW), STUDY_STATUS_EXPIRED);
+        assert.strictEqual(studyStatusLabel({...expired, status: "Active"}, NOW), STUDY_STATUS_EXPIRED);
+    });
+
+    // Fail OPEN here, unlike shareStatus: isSessionExpired never treats a missing date as expired,
+    // so a legacy or permanent study (the seeder $unsets expiredAt) reads Active rather than being
+    // labelled dead.
+    it("does not call a study with no usable expiry expired", function () {
+        assert.strictEqual(studyStatusLabel({status: "Active"}, NOW), STUDY_STATUS_ACTIVE);
+        assert.strictEqual(studyStatusLabel({expiredAt: null}, NOW), STUDY_STATUS_ACTIVE);
+        assert.strictEqual(studyStatusLabel({expiredAt: "nonsense"}, NOW), STUDY_STATUS_ACTIVE);
+        assert.strictEqual(studyStatusLabel({permanent: true}, NOW), STUDY_STATUS_ACTIVE);
+    });
+
+    it("falls back to Active when no status is stored", function () {
+        assert.strictEqual(studyStatusLabel({}, NOW), STUDY_STATUS_ACTIVE);
+    });
+
+    // These rows render on a page with no React error boundary above them, so a throw is a blank
+    // page rather than a broken cell.
+    it("never throws on a missing or malformed session", function () {
+        assert.strictEqual(studyStatusLabel(null, NOW), STUDY_STATUS_ACTIVE);
+        assert.strictEqual(studyStatusLabel(undefined, NOW), STUDY_STATUS_ACTIVE);
     });
 });

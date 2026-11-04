@@ -36,6 +36,14 @@ const TARGETS = [
         file: 'imports/client/pages/home/Analysis/Session/components/wizard/Step2_DataInput.jsx',
         requires: ['Radio'],
     },
+    {
+        // The share-link landing page renders the prior-imports <Table> and the warning <Alert>.
+        // Worth guarding here specifically: there is no React error boundary in this app, so a
+        // missing import is not one broken panel but a blank page — and the homepage's
+        // "View Example" picker navigates every visitor to this route.
+        file: 'imports/client/pages/home/Analysis/ImportShare/index.jsx',
+        requires: ['Table', 'Alert'],
+    },
 ];
 
 function fail(msg) {

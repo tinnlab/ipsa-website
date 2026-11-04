@@ -6,7 +6,7 @@
 // pValueFDR: 1} — type-valid against the pipeline's GeneInput model, therefore never rejected,
 // and unmatchable by the symbol-keyed reproducibility step.
 import assert from "assert";
-import { mapDatasetGenes } from "../imports/utils/datasetGenes";
+import { mapDatasetGenes, restrictGenesToSelection } from "../imports/utils/datasetGenes";
 
 // Real row shapes observed in the database (analysisConfigSnapshots).
 const DE_GENES_WITH_PVALUES = {
@@ -157,5 +157,56 @@ describe("dataset genes → interpretation payload", function () {
                 assert.strictEqual(symbolless, 0, "absent data must not be reported as a shape error");
             });
         });
+    });
+});
+
+// Meta-analysis grounding: per-dataset genes restricted to the user's selection. The selection
+// objects are the wizard's {id, name} — aiWorkflow reads `gene.name || gene.id` — with NO
+// geneSymbol, while a mapped dataset gene carries only geneSymbol.
+describe("dataset genes restricted to the meta selection", function () {
+    const {genes} = mapDatasetGenes([
+        {symbol: "Hk1", FC: 1.2, pValue: 1e-4, pValueFDR: 1e-3},
+        {symbol: "Cs", FC: -0.8},
+        {symbol: "Tp53", FC: 0.1},
+    ]);
+
+    it("matches a selection shaped as the wizard sends it (no geneSymbol)", function () {
+        const {kept} = restrictGenesToSelection(genes, [
+            {id: "gene-row-1", name: "Hk1", foldChange: 1.2},
+            {id: "gene-row-2", name: "Cs"},
+        ]);
+        assert.deepStrictEqual(kept.map(g => g.geneSymbol), ["Hk1", "Cs"]);
+        assert.ok(!("geneSymbol" in {id: "gene-row-1", name: "Hk1"}), "fixture mirrors the real shape");
+    });
+
+    it("is case-insensitive", function () {
+        const {kept} = restrictGenesToSelection(genes, [{name: "HK1"}, {name: " tp53 "}]);
+        assert.deepStrictEqual(kept.map(g => g.geneSymbol), ["Hk1", "Tp53"]);
+    });
+
+    it("matches a selection that only has an id", function () {
+        const {kept} = restrictGenesToSelection(genes, [{id: "CS"}]);
+        assert.deepStrictEqual(kept.map(g => g.geneSymbol), ["Cs"]);
+    });
+
+    it("keeps the mapped gene objects unchanged", function () {
+        const {kept} = restrictGenesToSelection(genes, [{name: "Hk1"}]);
+        assert.deepStrictEqual(kept[0], genes[0]);
+    });
+
+    it("an empty selection keeps nothing and reports a zero-size selection", function () {
+        const {kept, selectionSize} = restrictGenesToSelection(genes, []);
+        assert.deepStrictEqual(kept, []);
+        assert.strictEqual(selectionSize, 0);
+    });
+
+    it("a non-empty selection with no overlap reports its size, so the caller can flag it", function () {
+        const {kept, selectionSize} = restrictGenesToSelection(genes, [{name: "BRCA1"}]);
+        assert.deepStrictEqual(kept, []);
+        assert.strictEqual(selectionSize, 1);
+    });
+
+    it("tolerates junk input", function () {
+        assert.deepStrictEqual(restrictGenesToSelection(undefined, undefined).kept, []);
     });
 });

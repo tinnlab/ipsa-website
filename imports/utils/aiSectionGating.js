@@ -56,6 +56,31 @@ export function collectSubmissionSelections({
 }
 
 /**
+ * True when at least one of the selected analyses has gene-level (DE) data. `genes` is the
+ * wizard's per-analysis DE table; an analysis whose fetch returned nothing has an empty array (or no
+ * entry at all, e.g. a meta-analysis).
+ */
+export function hasGeneLevelData(analysisIds, genes) {
+    const ids = Array.isArray(analysisIds) ? analysisIds : [];
+    return ids.some((analysisId) => {
+        const rows = genes ? genes[analysisId] : null;
+        return Array.isArray(rows) && rows.length > 0;
+    });
+}
+
+/**
+ * The section flags now that the "Pathways" and "DE Genes" checkboxes are hidden and both sections
+ * are mandatory. Pathways are always on. Genes are on exactly when gene-level data exists: pinning
+ * them on for an analysis with none would describe a DE Genes section the report has no data for.
+ */
+export function mandatorySections({analysisIds, genes} = {}) {
+    return {
+        pathways: true,
+        genes: hasGeneLevelData(analysisIds, genes)
+    };
+}
+
+/**
  * The review step's "Selected Sections" line, read off the effective sections above so it describes
  * the payload rather than the checkboxes.
  */

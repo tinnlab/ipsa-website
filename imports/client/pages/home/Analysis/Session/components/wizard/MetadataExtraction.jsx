@@ -117,7 +117,7 @@ const MetadataExtraction = ({ analysisId, inputType, onMetadataExtracted }) => {
             <Space direction="vertical" size="middle" style={{ width: '100%' }}>
                 <Alert
                     message="What is metadata?"
-                    description="Metadata provides context about your experiment (e.g., tissue type, disease, treatment, time point). This information helps interpret analysis results and can be used for AI-powered interpretation."
+                    description="Metadata provides context about your experiment (e.g., tissue type, disease, treatment, time point). This information helps interpret analysis results and can be used for biological interpretation."
                     type="info"
                     closable
                     showIcon

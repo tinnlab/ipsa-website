@@ -3,7 +3,7 @@
 // Forest, Bar) and switching method tabs must update the figure (no stale plot).
 //
 // Visualization needs a COMPLETED analysis session, so point this at one:
-//   E2E_BASE_URL=http://localhost:18000 \
+//   E2E_BASE_URL=https://ipsa.tinnguyenlab.com \
 //   E2E_VIZ_PATH=/analysis/visualization/ZXFAwgeyigLe6sdgo \
 //   npx playwright test e2e/visualization-consensus.spec.js
 // Without E2E_VIZ_PATH the spec is skipped (no session to render).
@@ -43,13 +43,22 @@ test.describe('Visualization consensus (Bug 2)', () => {
       await consensus.click();
       // After selecting consensus we must see EITHER the consensus figure (svg/canvas)
       // OR the explicit empty message — but not silently the old fgsea figure.
-      const hasFigure = await page.locator('svg, canvas').first().isVisible().catch(() => false);
-      const hasEmptyMsg = await page
-        .getByText(/no result found for this method/i)
-        .first()
-        .isVisible()
-        .catch(() => false);
-      expect(hasFigure || hasEmptyMsg).toBeTruthy();
+      // Scoped to the Circos SVG's own id (circos-d3 sets id="circos-svg-<chartId>"). A bare
+      // 'svg, canvas' matches any antd icon on the page — including the plot's own SVG/PNG
+      // export buttons — so it was satisfied before a chart existed.
+      //
+      // Because that loose selector matched instantly, a bare isVisible() used to pass
+      // immediately. A correctly scoped one has to WAIT: right after the tab click the pane
+      // is still loading, so poll for whichever settled state arrives.
+      const figure = page.locator('svg[id^="circos-svg-"]').first();
+      const emptyMsg = page.getByText(/no result found for this method/i).first();
+      await expect
+        .poll(async () => {
+          const hasFigure = await figure.isVisible().catch(() => false);
+          const hasEmptyMsg = await emptyMsg.isVisible().catch(() => false);
+          return hasFigure || hasEmptyMsg;
+        }, { timeout: 30_000 })
+        .toBeTruthy();
     }
   });
 });

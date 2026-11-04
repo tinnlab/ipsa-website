@@ -4,11 +4,14 @@ import { check, Match } from 'meteor/check';
 import { Random } from 'meteor/random';
 import axios from 'axios';
 import { aggregateMetadataValue } from '../../../imports/utils/metadataValues';
-import { mapDatasetGenes } from '../../../imports/utils/datasetGenes';
+import { mapDatasetGenes, restrictGenesToSelection } from '../../../imports/utils/datasetGenes';
 import {
+  addRawPathwayKeys,
+  buildPathwaySelection,
   indexGeneSets,
   indexGeneSymbols,
   mapDatasetPathways,
+  restrictPathwaysToSelection,
   selectSignificantPathwayIds
 } from '../../../imports/utils/datasetPathways';
 import {
@@ -18,6 +21,7 @@ import {
 } from '../../../imports/utils/aiPathwayGenes';
 import { getDEGenes } from './visualizationCore';
 import { assertOwnsAnalysis, assertOwnsSession, assertWritableSession } from '../../helper/ownership';
+import { interpretationRefusal, resolveInputTypePolicy } from '../../../imports/utils/inputTypePolicy';
 
 // External pipeline API configuration
 const EXTERNAL_API_BASE_URL = process.env.EXTERNAL_PIPELINE_API_URL || 'http://host.docker.internal:6000';
@@ -163,8 +167,13 @@ async function fetchGeneSymbols(geneIds, analysisId, cache) {
  * `row.genes || []`), which only ever works for the CONSENSUS row shape; the rows a per-method
  * run stores carry neither, so every standard-database pathway shipped as its raw id with an empty
  * gene list. See imports/utils/datasetPathways.js for the full note.
+ *
+ * `selection` (a `buildPathwaySelection` result) is passed only by the meta-analysis transform:
+ * the list is then restricted to the user's selected pathways AFTER the FDR filter, i.e.
+ * (selected AND significant in this dataset). Without it the behaviour is exactly as before —
+ * the single-analysis payload relies on that.
  */
-async function getDatasetPathways(analysisId, sessionId, cache = createPathwayLookupCache()) {
+async function getDatasetPathways(analysisId, sessionId, cache = createPathwayLookupCache(), selection = null) {
   // The cache is shared across a submission's datasets, but must never be OPTIONAL to the helpers
   // below: a missing one would make every lookup miss and hand back exactly the empty gene lists
   // this change exists to fix. Defaulted here so a standalone call still resolves fully.
@@ -218,6 +227,8 @@ async function getDatasetPathways(analysisId, sessionId, cache = createPathwayLo
 
   const diagnostics = {unnamed: 0, unnamedIds: [], symbolless: 0, symbollessIds: [],
                        emptyMembership: 0, ambiguousOrganism: 0};
+  // Every id field of every row, for matching against the selection (meta transform only).
+  const rawPathwayKeys = selection ? new Map() : null;
 
   for (const db of databases) {
     // Database might be stored as a string (just the ID) or as an object
@@ -297,6 +308,7 @@ async function getDatasetPathways(analysisId, sessionId, cache = createPathwayLo
       });
 
       pathways.push(...mapped.pathways);
+      if (rawPathwayKeys) addRawPathwayKeys(rows, rawPathwayKeys);
       diagnostics.unnamed += mapped.unnamed;
       diagnostics.unnamedIds.push(...mapped.unnamedIds);
       diagnostics.symbolless += mapped.symbolless;
@@ -346,13 +358,38 @@ async function getDatasetPathways(analysisId, sessionId, cache = createPathwayLo
   if (significantPathways.length > 0) {
     console.log(`  [getDatasetPathways] Sample pathway:`, JSON.stringify(significantPathways[0], null, 2));
   }
-  return significantPathways;
+  if (!selection) {
+    return significantPathways;
+  }
+
+  const {kept, matchedById, matchedByName} =
+    restrictPathwaysToSelection(significantPathways, rawPathwayKeys, selection);
+  console.log(
+    `  [getDatasetPathways] Restricted to the selection: ${significantPathways.length} -> ` +
+    `${kept.length} (by id: ${matchedById}, by name: ${matchedByName}; ` +
+    `${selection.ids.size} selected ids)`
+  );
+  if (selection.ids.size > 0 && significantPathways.length > 0 && kept.length === 0) {
+    // Possible when none of the selected pathways is significant in this dataset, but it is
+    // also exactly what an id-space mismatch looks like — and the report would then print it
+    // as a finding. Loud, so the two can be told apart.
+    console.error(
+      `  [getDatasetPathways] ❌ Selection restriction left analysis ${analysisId} with 0 of ` +
+      `${significantPathways.length} significant pathways (${selection.ids.size} selected ids). ` +
+      `If the selected pathways are significant here, this is a matching bug, not a result. ` +
+      `Sample dataset ids: ${JSON.stringify(significantPathways.slice(0, 5).map(p => p.pathwayId))}`
+    );
+  }
+  return kept;
 }
 
 /**
  * Helper: Get DE genes for a specific dataset (if expression-based)
+ *
+ * `selectedGenes` (the meta submission's `data.genes`) restricts the list to the user's
+ * selection; omitted, the full list ships as before.
  */
-async function getDatasetGenes(analysisId, sessionId) {
+async function getDatasetGenes(analysisId, sessionId, selectedGenes = null) {
   // Read the SAME source as the DE-genes table in the AI-interpretation view — /api/deGenes,
   // i.e. getDEGenes → the `DEGenes` snapshot — so this payload cannot drift from what the user
   // sees. This previously read the `volcanoPlotData` snapshot and mapped `gene.gene`,
@@ -381,7 +418,67 @@ async function getDatasetGenes(analysisId, sessionId) {
     );
   }
 
-  return genes;
+  if (!selectedGenes) {
+    return genes;
+  }
+
+  const {kept, selectionSize} = restrictGenesToSelection(genes, selectedGenes);
+  console.log(
+    `  [getDatasetGenes] Restricted to the selection: ${genes.length} -> ${kept.length} ` +
+    `(${selectionSize} selected keys)`
+  );
+  if (selectionSize > 0 && genes.length > 0 && kept.length === 0) {
+    // The selection comes from the same DE genes the datasets carry, so zero overlap is a
+    // matching bug, not a result — and it would ship every dataset with no genes.
+    console.error(
+      `  [getDatasetGenes] ❌ Selection restriction left analysis ${analysisId} with 0 of ` +
+      `${genes.length} genes (${selectionSize} selected keys). This is a matching bug, not a ` +
+      `result. Sample dataset symbols: ${JSON.stringify(genes.slice(0, 5).map(g => g.geneSymbol))}; ` +
+      `sample selection: ${JSON.stringify(selectedGenes.slice(0, 5).map(g => g.name || g.id))}`
+    );
+  }
+  return kept;
+}
+
+/**
+ * Throw when this interpretation request cannot be grounded in gene-level statistics
+ * (imports/utils/inputTypePolicy.js interpretationRefusal): an analysis of a blocked input type
+ * (interpretationBlockedInputTypes, default ["ora"]), or one with no non-empty volcanoPlotData
+ * snapshot — the same signal as the client's `hasGeneResults`
+ * (visualizationCore.js getConfigurationsForSession), read here without loading the array.
+ * For a meta-analysis the datasets are metaAnalysisData.individualAnalyses, and the request is
+ * refused only when every dataset is blocked or none has results.
+ *
+ * Callers have already proven ownership of every id read here.
+ */
+async function assertInterpretable(data) {
+  const isMeta = data.analysisType === 'meta-analysis';
+  const individual = (data.metaAnalysisData?.individualAnalyses || []).map(a => a.id);
+  const direct = [data.analysisId, ...(data.analyses || []).map(a => a.id)];
+  const ids = [...new Set((isMeta && individual.length ? individual : direct).filter(Boolean))];
+  if (ids.length === 0) return;
+
+  const sessions = await DBCollections.Session.find(
+    {'analyses.id': {$in: ids}},
+    {fields: {analyses: 1}}
+  ).fetchAsync();
+  const inputTypeById = new Map(
+    sessions.flatMap(s => (s.analyses || []).map(a => [a.id, a.input]))
+  );
+  const withResults = await DBCollections.AnalysisConfigSnapshot.find(
+    {analysisId: {$in: ids}, key: 'volcanoPlotData', 'value.0': {$exists: true}},
+    {fields: {analysisId: 1}}
+  ).fetchAsync();
+  const hasResults = new Set(withResults.map(row => row.analysisId));
+
+  const refusal = interpretationRefusal(
+    ids.map(id => ({inputType: inputTypeById.get(id), hasGeneResults: hasResults.has(id)})),
+    {isMeta, blocked: resolveInputTypePolicy(Meteor.settings.private).interpretationBlockedInputTypes}
+  );
+  if (refusal) {
+    console.log('[aiWorkflow.startPublicationReady] refused:', refusal.code, ids);
+    throw new Meteor.Error(refusal.code, refusal.reason);
+  }
 }
 
 /**
@@ -436,6 +533,10 @@ async function transformMetaAnalysisToExternalFormat(data) {
   // Shared across every dataset below: they are usually the same database and organism over a
   // largely overlapping pathway space, so this collapses ~15 GeneSet/GeneInfo round trips into ~1.
   const pathwayLookupCache = createPathwayLookupCache();
+  // Ground every dataset in the user's selection: the per-dataset lists become
+  // (selected AND significant in that dataset), one pathway and one gene universe for the report.
+  const pathwaySelection = buildPathwaySelection(data.pathways);
+  const geneSelection = Array.isArray(data.genes) ? data.genes : [];
 
   if (data.metaAnalysisData) {
     const { datasetsMetadata, individualAnalyses } = data.metaAnalysisData;
@@ -458,8 +559,10 @@ async function transformMetaAnalysisToExternalFormat(data) {
       Object.keys(datasetMetadata).forEach(field => allMetadataFields.add(field));
 
       // Fetch individual dataset pathway results
-      const datasetPathways = await getDatasetPathways(analysis.id, data.sessionId, pathwayLookupCache);
-      const datasetGenes = await getDatasetGenes(analysis.id, data.sessionId);
+      const datasetPathways = await getDatasetPathways(
+        analysis.id, data.sessionId, pathwayLookupCache, pathwaySelection
+      );
+      const datasetGenes = await getDatasetGenes(analysis.id, data.sessionId, geneSelection);
 
       console.log(`    - Pathways: ${datasetPathways.length}`);
       console.log(`    - Genes: ${datasetGenes.length}`);
@@ -721,10 +824,18 @@ async function transformToExternalFormat(data) {
     metadata: metadata,
     genes,
     pathways,
-    enable_validation: true,
+    enable_validation: false,
     strict_mode: false
   };
 }
+
+// Exported for tests/ai-workflow-payload.tests.js only (payload-shape regression tests).
+export {
+  getDatasetGenes,
+  getDatasetPathways,
+  transformMetaAnalysisToExternalFormat,
+  transformToExternalFormat
+};
 
 Meteor.methods({
   /**
@@ -780,6 +891,11 @@ Meteor.methods({
         await assertOwnsAnalysis({analysisId: analysis.id, requesterUserId: this.userId});
       }
     }
+
+    // Refuse what cannot be grounded BEFORE anything reaches the pipeline. With no gene-level
+    // statistics the hypothesis step returns zero hypotheses, and the meta route's fallback has
+    // fabricated statistics; a disabled button in the UI is not a guarantee, so this is the gate.
+    await assertInterpretable(data);
 
     console.log('\n[aiWorkflow.startPublicationReady] Starting external API workflow...');
 

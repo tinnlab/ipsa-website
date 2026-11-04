@@ -66,3 +66,80 @@ export function resolveDeepLinkSelection(search, studies = []) {
 
     return { sessionId, analysisId: null, displayName: study.name };
 }
+
+// ---------------------------------------------------------------------------------------------
+// The AI-interpretation page's URL, in one place.
+//
+// `${urlPrefix}/ai-interpretation` is a static route with no path params, so everything the page
+// needs to reopen itself travels in the QUERY string:
+//
+//   ?sessionId=<Session._id>&analysisId=<analysis id>&reportId=<BatchInfo._id>
+//
+// sessionId/analysisId already existed — Visualization's "Generate Insight" sends the first,
+// Step5_RunAnalysis's "Interpret" sends both. reportId is new: it names the open report, so a
+// refresh or a pasted link lands back on it instead of on the list. Parsing and building live here
+// rather than inline in the pages so the three producers cannot drift apart, and so the format is
+// testable without a router.
+
+// Read the ids out of a query string. An absent param and an empty one (`?reportId=`) mean the same
+// thing — absent — because a blank id names nothing. All three keys are always present in the
+// result so callers can destructure without guards.
+export function parseAIInterpretationLink(search) {
+    const params = new URLSearchParams(typeof search === 'string' ? search : '');
+    const read = (key) => params.get(key) || null;
+    return {
+        sessionId: read('sessionId'),
+        analysisId: read('analysisId'),
+        reportId: read('reportId'),
+    };
+}
+
+// The inverse. Empty/missing ids are omitted rather than written as blanks, and the key order is
+// FIXED (sessionId, analysisId, reportId) so a rebuilt link is byte-identical to the hand-written
+// ones the producer pages send today — which is what lets them all adopt this builder without
+// changing a single URL. Returns '' (not '?') when there is nothing to say, which is what
+// `navigate({search})` wants for "the bare page".
+export function buildAIInterpretationLink({ sessionId, analysisId, reportId } = {}) {
+    const params = new URLSearchParams();
+    if (sessionId) params.set('sessionId', sessionId);
+    if (analysisId) params.set('analysisId', analysisId);
+    if (reportId) params.set('reportId', reportId);
+    const query = params.toString();
+    return query ? `?${query}` : '';
+}
+
+// The part of the URL that names a SELECTION, ignoring which report is open.
+//
+// This is load-bearing. The page re-applies a deep-linked selection when and only when this key
+// changes, so opening or closing a report — which moves reportId alone — cannot reset the sidebar,
+// close the wizard, or fight a click the user just made. The previous guard was a once-only
+// boolean, which consumed the URL forever and left Back/Forward moving the address bar and nothing
+// else.
+export function selectionKeyFromSearch(search) {
+    const { sessionId, analysisId } = parseAIInterpretationLink(search);
+    return `${sessionId || ''}|${analysisId || ''}`;
+}
+
+// Resolve ?reportId= against the batch list the page has ALREADY loaded (queue.getUserBatches,
+// which the server scopes to the owner). No second round-trip, and no new trust: an id that is not
+// in that list is one the server would refuse anyway, so a guessable URL grants nothing on its own.
+//
+// The answer is three-way rather than a boolean because of the load race. `batches` starts empty,
+// and an empty list is indistinguishable from "no such report" — answering "unknown" there would
+// flash a false error on every pasted link before the fetch lands. 'pending' says "ask again";
+// only a LOADED list can produce 'unknown'.
+//
+//   {status:'none',    batchId:null}   -> no report named; show the list
+//   {status:'pending', batchId}        -> named, list not loaded yet; show a spinner
+//   {status:'ok',      batchId, batch} -> open it
+//   {status:'unknown', batchId}        -> stale, deleted or foreign; fall back to the list and say so
+export function resolveDeepLinkReport(search, batches, batchesLoaded = false) {
+    const { reportId } = parseAIInterpretationLink(search);
+    if (!reportId) return { status: 'none', batchId: null, batch: null };
+    if (!batchesLoaded) return { status: 'pending', batchId: reportId, batch: null };
+
+    const batch = (batches || []).find(b => b && b._id === reportId) || null;
+    if (!batch) return { status: 'unknown', batchId: reportId, batch: null };
+
+    return { status: 'ok', batchId: reportId, batch };
+}

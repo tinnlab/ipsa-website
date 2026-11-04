@@ -84,3 +84,35 @@ export function mapDatasetGenes(rows) {
 
     return {genes, total: list.length, symbolless, sampleKeys};
 }
+
+const geneKey = (v) => {
+    if (v === undefined || v === null) return null;
+    const s = String(v).trim().toLowerCase();
+    return s === '' ? null : s;
+};
+
+/**
+ * Keep the dataset genes the user selected, so a meta-analysis's per-dataset genes share the
+ * meta level's gene universe.
+ *
+ * The selection objects are the wizard's `{id, name, ...}` — `aiWorkflow.js` reads them as
+ * `gene.name || gene.id` and they carry NO `geneSymbol` — while a mapped dataset gene carries
+ * only `geneSymbol`. So the selection contributes both `name` and `id`, and everything is
+ * case-folded. Never mutates the input.
+ *
+ * @param {Array<object>} genes     `mapDatasetGenes(...).genes`
+ * @param {Array<object>} selected  `data.genes` of the meta submission
+ * @returns {{kept: Array<object>, selectionSize: number}}
+ */
+export function restrictGenesToSelection(genes, selected) {
+    const keys = new Set();
+    (Array.isArray(selected) ? selected : []).forEach((g) => {
+        if (!g) return;
+        [g.name, g.id].forEach((v) => {
+            const k = geneKey(v);
+            if (k) keys.add(k);
+        });
+    });
+    const kept = (Array.isArray(genes) ? genes : []).filter((g) => keys.has(geneKey(g?.geneSymbol)));
+    return {kept, selectionSize: keys.size};
+}

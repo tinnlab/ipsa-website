@@ -2,11 +2,104 @@ import React, {useEffect, useState} from "react";
 import {Meteor} from "meteor/meteor";
 import {Random} from "meteor/random";
 import {useTracker} from "meteor/react-meteor-data";
-import {useNavigate, useParams} from "react-router-dom";
+import {Link, useNavigate, useParams} from "react-router-dom";
 import {Helmet} from "react-helmet";
-import {Alert, Button, Card, Layout, Progress, Result, Space, Spin, Tag, Typography} from "antd";
+import {Alert, Button, Card, Layout, Progress, Result, Space, Spin, Table, Tag, Typography} from "antd";
+import moment from "moment";
+import {fullImportLostInputs} from "/imports/utils/shareLink";
+import {formatDaysLeft, isSessionExpired, studyStatusLabel} from "/imports/utils/retention";
 
 const {Paragraph, Text, Title} = Typography;
+
+// The caller's earlier copies of the study being offered. Mirrors the Recent Studies table
+// (RecentSessions/index.jsx) column for column and computes every cell with the same helpers, so one
+// study cannot read one way there and another way here.
+//
+// Every renderer degrades rather than assuming. These rows can carry legacy or hand-edited data, and
+// there is no React error boundary anywhere in this app, so a throw in a single cell blanks the
+// whole page — on the page the homepage's "View Example" picker sends every visitor to.
+// Epoch ms for a stored timestamp, or null when there is nothing usable.
+//
+// Parsed through Date rather than handed to moment as a string: moment falls back to `new
+// Date(string)` for anything it does not recognise and logs a deprecation warning to the console for
+// EVERY such row. The rows here can carry legacy or hand-edited values, so that fallback is reached
+// in normal operation — and a console full of warnings is how a real error stops being noticed.
+const timestampMs = (value) => {
+    if (value === null || value === undefined) return null;
+    const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
+    return Number.isFinite(ms) ? ms : null;
+};
+
+const priorImportColumns = [
+    {
+        title: "Study",
+        dataIndex: "name",
+        key: "name",
+        render: (name) => name || "Untitled study",
+    },
+    {
+        title: "Imported",
+        dataIndex: "importedAt",
+        key: "importedAt",
+        render: (importedAt) => {
+            // moment(undefined) is NOW, so an absent or unparseable stamp would render as "just
+            // imported" — the most misleading value available on a table about what you already
+            // have. Say nothing instead.
+            //
+            // Seconds, matching RecentSessions' "Created At" exactly. Not cosmetic: importing the
+            // same study twice in a row is the ordinary case here, and at minute precision the two
+            // copies render as identical rows on the one table whose job is to tell them apart.
+            const ms = timestampMs(importedAt);
+            return ms === null ? "—" : moment(ms).format("YYYY-MM-DD HH:mm:ss");
+        },
+    },
+    {
+        // Uncoloured, matching the owner's own link table (ShareModal.jsx "Scope"), so it does not
+        // compete with the blue mode tag this page already shows for the incoming study.
+        title: "Scope",
+        dataIndex: "mode",
+        key: "mode",
+        render: (mode) => <Tag>{mode === "full" ? "Everything" : "Results only"}</Tag>,
+    },
+    {
+        title: "Expires In",
+        key: "expiresIn",
+        render: (_, record) => {
+            // The same three-way rule as RecentSessions: a permanent study has no expiry to count
+            // down, an expired one shows nothing (the Status column says so), and the rest count
+            // down in whole days, turning red inside the last five.
+            if (record.permanent === true) return "Never";
+            if (isSessionExpired({expiredAt: record.expiredAt, nowMs: Date.now()})) return "";
+            const ms = timestampMs(record.expiredAt);
+            if (ms === null) return "—";
+            const expiredAt = moment(ms);
+            const currentTime = moment();
+            const style = expiredAt.diff(currentTime, "days") < 5 ? {color: "red"} : {};
+            return <span style={style}>{formatDaysLeft(expiredAt.diff(currentTime))}</span>;
+        },
+    },
+    {
+        title: "Status",
+        key: "status",
+        render: (_, record) => studyStatusLabel(record, Date.now()),
+    },
+    {
+        key: "actions",
+        render: (_, record) => {
+            const expired = isSessionExpired({expiredAt: record.expiredAt, nowMs: Date.now()});
+            return (
+                <Button size="small" disabled={expired}>
+                    <Link
+                        to={`${window.urlPrefix || ""}/analysis/visualization/${record.studyId}`}
+                        disabled={expired}
+                    >
+                        Open
+                    </Link>
+                </Button>
+            );
+        },
+    },
+];
 
 // Landing page for a share link.
 //
@@ -71,7 +164,18 @@ export default () => {
         const id = Random.id();
         setProgressId(id);
         try {
-            const {sessionId} = await Meteor.callAsync("share.import", {shareId, progressId: id});
+            const {sessionId, counts} = await Meteor.callAsync("share.import", {shareId, progressId: id});
+            // A full import that copied no input files still produced a perfectly viewable study —
+            // results, plots and AI reports all came across — but it cannot be RE-RUN. The clone
+            // reports success either way (copyUploadDir swallows an unreadable donor directory and
+            // returns {copied: 0}), so without this the recipient discovers the gap only when a
+            // re-run fails. Warn and continue rather than block: the study is worth opening, and it
+            // already exists by the time we know.
+            if (fullImportLostInputs(preview?.mode, counts)) {
+                notify.warning(
+                    "The copy opened, but its uploaded input data was not available — you can explore it, but not re-run it."
+                );
+            }
             // Navigate on the method's own result rather than waiting for the progress document:
             // it is authoritative and already resolved by this point.
             if (sessionId) {
@@ -106,6 +210,9 @@ export default () => {
         if (!preview) return <Space><Spin/><Text type="secondary">Checking the link…</Text></Space>;
 
         const metaAnalysisNames = preview.metaAnalysisNames || [];
+        const priorImports = preview.priorImports || [];
+        const priorImportsTotal = preview.priorImportsTotal || 0;
+        const alreadyImported = priorImports.length > 0;
 
         if (importing) {
             return (
@@ -167,24 +274,71 @@ export default () => {
                         description={
                             preview.mode === "full"
                                 ? "You will get a full copy, including the uploaded data, which you can re-run and edit. Later changes to the original will not affect it."
-                                : "You will get a view-only copy: results and AI reports, without the uploaded data. You can explore and export, but not re-run or edit it."
+                                : "You will get a view-only copy: results and biological interpretation reports, without the uploaded data. You can explore and export, but not re-run or edit it."
                         }
                     />
 
-                    {preview.isOwnStudy && (
+                    {/* ONE alert, not two. Both facts can be true at once — you can import your own
+                        study, and you can have imported it before — and two stacked warnings would
+                        say overlapping things about the same consequence. So the headline names
+                        whichever case applies and the consequence is stated once, below it. */}
+                    {(preview.isOwnStudy || alreadyImported) && (
                         <Alert
                             type="warning"
                             showIcon
-                            message="This is your own study"
-                            description="Importing will create a second copy in your account."
+                            message={
+                                preview.isOwnStudy
+                                    ? (alreadyImported
+                                        ? "This is your own study, and you have imported it before"
+                                        : "This is your own study")
+                                    : "You have imported this study before"
+                            }
+                            description={
+                                "Importing creates a separate, additional copy in your account. " +
+                                "It does not update, merge with, or replace a copy you already have."
+                            }
                         />
+                    )}
+
+                    {/* Nothing at all in the normal case: this is a landing page for a link, and a
+                        "you have not imported this yet" banner would be noise on every first visit. */}
+                    {alreadyImported && (
+                        <div>
+                            <Text strong>Studies you have already imported from this one</Text>
+                            <Table
+                                style={{marginTop: 8}}
+                                size="small"
+                                columns={priorImportColumns}
+                                dataSource={priorImports}
+                                rowKey="studyId"
+                                pagination={priorImports.length > 5 ? {pageSize: 5} : false}
+                                // Six columns do not fit the card's width on a narrow screen; scroll
+                                // the table rather than letting the page scroll sideways.
+                                scroll={{x: true}}
+                            />
+                            {/* The cap is stated, never silent: a table whose whole job is to say
+                                "here is what you already have" must not present a truncated list as
+                                a complete one. */}
+                            {priorImportsTotal > priorImports.length && (
+                                <Text type="secondary">
+                                    {`Showing the ${priorImports.length} most recent of ${priorImportsTotal} copies — see all of them in your studies.`}
+                                </Text>
+                            )}
+                        </div>
                     )}
 
                     {failure && <Alert type="error" showIcon message={failure}/>}
 
-                    <Button type="primary" onClick={handleImport}>
-                        Add to my studies
-                    </Button>
+                    <Space>
+                        <Button type="primary" onClick={handleImport}>
+                            Add to my studies
+                        </Button>
+                        {/* Same destination and same label as the error branch above, so the page
+                            has one name for the place your studies live. */}
+                        <Button onClick={() => navigate(`${window.urlPrefix || ""}/analysis/recent-studies`)}>
+                            Go to my studies
+                        </Button>
+                    </Space>
                 </Space>
             </Card>
         );

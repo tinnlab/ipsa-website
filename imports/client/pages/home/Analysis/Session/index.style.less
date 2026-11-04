@@ -8,16 +8,22 @@
 
   display: flex;
 
+  // The study title row: the heading plus its rename control (edit icon, or the input + Save/Cancel
+  // while editing). Spacing between the controls comes from the row's flex gap.
   .session-name {
+    // antd puts 1.2em/0.5em margins on the heading itself. Left there, centring the row would
+    // align the heading's MARGIN box and drop the title 12px below the edit icon — so the spacing
+    // moves onto the row and the heading keeps only its own 32px line box.
+    margin-top: 24px;
     margin-bottom: 10px;
 
-    .edit-icon {
-      margin-left: 5px;
-      margin-top: 10px;
-      cursor: pointer;
+    h3.ant-typography {
+      margin-top: 0;
+      margin-bottom: 0;
     }
     .session-name-input {
-      width: 200px;
+      width: 100%;
+      max-width: 420px;
     }
   }
 

@@ -66,6 +66,108 @@ export const selectSignificantPathwayIds = (rows) => {
     return Array.from(ids);
 };
 
+// ---------------------------------------------------------------------------------------------
+// Restricting a meta-analysis's per-dataset pathway lists to the user's selection, so the whole
+// meta report has one pathway universe: (selected AND significant in that dataset).
+//
+// The two sides prefer different fields of the same kind of row. A dataset row's id is
+// `row.pathway || row.ID` (readPathwayId), while a selection's `originalId` is `pathway.ID` on the
+// meta/consensus wizard paths but `pathway.pathway` on another. So both sides contribute EVERY
+// id field they have, and a match on any of them counts: matching cannot fail merely because the
+// two sides prefer different fields. The name is a last resort, lightly normalised.
+// ---------------------------------------------------------------------------------------------
+
+const idKey = (v) => (v === undefined || v === null || v === '' ? null : String(v));
+
+const nameKey = (v) => (typeof v === 'string' && v.trim() !== ''
+    ? v.trim().toLowerCase().replace(/\s+/g, ' ')
+    : null);
+
+/**
+ * Id and name keys of the user's selected (meta-level) pathways, as the wizard builds them:
+ * `{id: '<database>:<ID>', originalId, name, database, ...}`. The `id` suffix after
+ * `<database>:` is added too, but only when the prefix really is the pathway's database.
+ *
+ * @param {Array<object>} selected  `data.pathways` of the meta submission
+ * @returns {{ids: Set<string>, names: Set<string>}}
+ */
+export function buildPathwaySelection(selected) {
+    const ids = new Set();
+    const names = new Set();
+    (Array.isArray(selected) ? selected : []).forEach((p) => {
+        if (!p) return;
+        [p.originalId, p.id].forEach((v) => {
+            const k = idKey(v);
+            if (k) ids.add(k);
+        });
+        const id = idKey(p.id);
+        const db = idKey(p.database);
+        if (id && db && id.startsWith(`${db}:`) && id.length > db.length + 1) {
+            ids.add(id.slice(db.length + 1));
+        }
+        const n = nameKey(p.name);
+        if (n) names.add(n);
+    });
+    return {ids, names};
+}
+
+/**
+ * Every id field of each raw result row, keyed by the id `mapDatasetPathways` emits as
+ * `pathwayId`. Needed because the mapped object keeps only one id (and its shape must not
+ * change: the single-analysis payload uses it too).
+ *
+ * @param {Array<object>} rows  `AnalysisResult.value` rows (any number of databases)
+ * @param {Map<string, Set<string>>} [into]  lookup to add to
+ * @returns {Map<string, Set<string>>}
+ */
+export function addRawPathwayKeys(rows, into = new Map()) {
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+        const emitted = idKey(readPathwayId(row));
+        if (!emitted) return;
+        const keys = into.get(emitted) || new Set([emitted]);
+        [row?.pathway, row?.ID].forEach((v) => {
+            const k = idKey(v);
+            if (k) keys.add(k);
+        });
+        into.set(emitted, keys);
+    });
+    return into;
+}
+
+/**
+ * Keep the dataset pathways the user selected: an id match on any id field of either side,
+ * otherwise a normalised-name match. Never mutates the input.
+ *
+ * @param {Array<object>} pathways   mapped dataset pathways (`{name, pathwayId, ...}`)
+ * @param {Map<string, Set<string>>} rawKeys  `addRawPathwayKeys` output for the same rows
+ * @param {{ids: Set<string>, names: Set<string>}} selection  `buildPathwaySelection` output
+ * @returns {{kept: Array<object>, matchedById: number, matchedByName: number}}
+ */
+export function restrictPathwaysToSelection(pathways, rawKeys, selection) {
+    const lookup = rawKeys instanceof Map ? rawKeys : new Map();
+    const ids = selection?.ids instanceof Set ? selection.ids : new Set();
+    const names = selection?.names instanceof Set ? selection.names : new Set();
+
+    const kept = [];
+    let matchedById = 0;
+    let matchedByName = 0;
+    (Array.isArray(pathways) ? pathways : []).forEach((p) => {
+        const own = idKey(p?.pathwayId);
+        const candidates = new Set(own ? [own, ...(lookup.get(own) || [])] : []);
+        if ([...candidates].some((k) => ids.has(k))) {
+            matchedById += 1;
+            kept.push(p);
+            return;
+        }
+        const n = nameKey(p?.name);
+        if (n && names.has(n)) {
+            matchedByName += 1;
+            kept.push(p);
+        }
+    });
+    return {kept, matchedById, matchedByName};
+}
+
 /**
  * Index `GeneSet` documents (`{id, name, genes}`, already scoped to one database + organism) by
  * pathway id. `genes` is a list of bare NCBI Entrez ids for every gene-set builder in this codebase

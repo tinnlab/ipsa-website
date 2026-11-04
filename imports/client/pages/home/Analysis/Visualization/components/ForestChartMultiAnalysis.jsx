@@ -6,6 +6,7 @@ import GeneLoading from "../../../../../components/GeneLoading";
 import {Checkbox, Select, Space, Typography, Divider, Radio, InputNumber} from "antd";
 import { useGlobalSettings } from "../../../../../contexts/GlobalSettingsContext";
 import _ from "lodash";
+import { passesSignificance } from "../../../../../../utils/significanceFilter";
 
 const {Text} = Typography;
 const {Option} = Select;
@@ -94,9 +95,8 @@ export default ({analysisResultsByDb, selectedAnalysisMethods, analysisNames, co
                 if (filterLogic === 'any') {
                     // Pathway is significant if it meets criteria in ANY analysis
                     const isSignificant = pathwayData.some(data => {
-                        const passesFdr = fdrThreshold === 0 || data.pValueFDR < fdrThreshold;
-                        const passesScore = scoreThreshold === 0 || Math.abs(data.score) > scoreThreshold;
-                        return passesFdr && passesScore;
+                        // FDR <= x and |Score| >= y; a 0 threshold disables that filter.
+                        return passesSignificance(data, {fdr: fdrThreshold, score: scoreThreshold});
                     })
                     if (isSignificant) {
                         significantPathways.add(pathwayId)
@@ -104,9 +104,8 @@ export default ({analysisResultsByDb, selectedAnalysisMethods, analysisNames, co
                 } else if (filterLogic === 'all') {
                     // Pathway is significant if it meets criteria in ALL analyses
                     const isSignificant = pathwayData.every(data => {
-                        const passesFdr = fdrThreshold === 0 || data.pValueFDR < fdrThreshold;
-                        const passesScore = scoreThreshold === 0 || Math.abs(data.score) > scoreThreshold;
-                        return passesFdr && passesScore;
+                        // FDR <= x and |Score| >= y; a 0 threshold disables that filter.
+                        return passesSignificance(data, {fdr: fdrThreshold, score: scoreThreshold});
                     })
                     if (isSignificant) {
                         significantPathways.add(pathwayId)
@@ -529,7 +528,7 @@ export default ({analysisResultsByDb, selectedAnalysisMethods, analysisNames, co
                             {enableSignificantFilter && (
                                 <>
                                     <Text type="secondary">|</Text>
-                                    <Text>FDR &lt;</Text>
+                                    <Text>FDR &le;</Text>
                                     <Select
                                         value={fdrThreshold}
                                         onChange={setFdrThreshold}
@@ -544,7 +543,7 @@ export default ({analysisResultsByDb, selectedAnalysisMethods, analysisNames, co
                                         <Option value={1.0}>1.0 (show all)</Option>
                                     </Select>
                                     <Text type="secondary">|</Text>
-                                    <Text>|Score| &gt;</Text>
+                                    <Text>|Score| &ge;</Text>
                                     <Select
                                         value={scoreThreshold}
                                         onChange={setScoreThreshold}
@@ -562,7 +561,7 @@ export default ({analysisResultsByDb, selectedAnalysisMethods, analysisNames, co
                         </Space>
                         <Text type="secondary" style={{fontSize: '12px'}}>
                             {enableSignificantFilter
-                                ? `No pathways meet the significance criteria (FDR < ${fdrThreshold} and |Score| > ${scoreThreshold}). Try adjusting the thresholds or unchecking the filter.`
+                                ? `No pathways meet the significance criteria (FDR ≤ ${fdrThreshold} and |Score| ≥ ${scoreThreshold}). Try adjusting the thresholds or unchecking the filter.`
                                 : 'Loading pathway data...'}
                         </Text>
                     </Space>
@@ -590,7 +589,7 @@ export default ({analysisResultsByDb, selectedAnalysisMethods, analysisNames, co
                         {enableSignificantFilter && (
                             <>
                                 <Text type="secondary">|</Text>
-                                <Text>FDR &lt;</Text>
+                                <Text>FDR &le;</Text>
                                 <Select
                                     value={fdrThreshold}
                                     onChange={setFdrThreshold}
@@ -625,7 +624,7 @@ export default ({analysisResultsByDb, selectedAnalysisMethods, analysisNames, co
                                     <Option value={0.1}>0.1</Option>
                                 </Select>
                                 <Text type="secondary">|</Text>
-                                <Text>|Score| &gt;</Text>
+                                <Text>|Score| &ge;</Text>
                                 <Select
                                     value={scoreThreshold}
                                     onChange={setScoreThreshold}

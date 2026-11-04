@@ -4,7 +4,7 @@
 //
 // Single source of truth for the AI-interpretation "DE Genes" selection controls
 // in AnalysisWizard.jsx:
-//   - "Select top N genes with FDR < X and |Log2FC| > Y"  -> selectTopGenes()
+//   - "Select top N genes with FDR <= X and |Log2FC| >= Y"  -> selectTopGenes()
 //   - "Use all DE Genes" (the analysis's significant DE gene set) -> selectAnalysisDEGenes()
 //
 // A gene object looks like {id, name, foldChange, pValue, pValueFDR, ...}.
@@ -17,21 +17,23 @@ export const DEFAULT_GENE_TOP_N = 5;
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : Number.POSITIVE_INFINITY);
 
 /**
- * Genes passing the DE thresholds: FDR strictly below `fdr` AND |Log2FC| strictly
- * above `fc`. Non-finite values (missing/NaN/±Infinity) are normalized so the
- * thresholds behave sensibly and, crucially, so the "select all" sentinel
- * (`fdr: Infinity, fc: -Infinity`) genuinely keeps EVERY gene:
+ * Genes passing the DE thresholds: FDR at or below `fdr` AND |Log2FC| at or
+ * above `fc` (inclusive, matching selectAnalysisDEGenes and the volcano export,
+ * so a gene sitting exactly on a threshold passes). Non-finite values
+ * (missing/NaN/±Infinity) are normalized so the thresholds behave sensibly and,
+ * crucially, so the "select all" sentinel (`fdr: Infinity, fc: -Infinity`)
+ * genuinely keeps EVERY gene:
  *   - a non-finite FDR is treated as 1 (not significant) — excluded by a real
- *     FDR filter, but `1 < Infinity` keeps it under the select-all sentinel.
+ *     FDR filter below 1, but `1 <= Infinity` keeps it under the select-all sentinel.
  *   - a non-finite |Log2FC| is treated as magnitude 0 — excluded by a real
- *     positive FC filter, but `0 > -Infinity` keeps it under the sentinel.
+ *     positive FC filter, but `0 >= -Infinity` keeps it under the sentinel.
  * Never mutates the input.
  */
 export function filterGenes(genes, { fdr, fc } = {}) {
     return (genes || []).filter((g) => {
         const gFdr = Number.isFinite(g?.pValueFDR) ? g.pValueFDR : 1;
         const gAbsFc = Number.isFinite(g?.foldChange) ? Math.abs(g.foldChange) : 0;
-        return gFdr < fdr && gAbsFc > fc;
+        return gFdr <= fdr && gAbsFc >= fc;
     });
 }
 

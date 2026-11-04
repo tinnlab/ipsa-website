@@ -1,11 +1,11 @@
-import React, {useEffect, useMemo, useState, useCallback} from "react";
+import React, {useEffect, useMemo, useRef, useState, useCallback} from "react";
 import _ from "lodash";
 import {Helmet} from "react-helmet";
 import {Tabs, Input, Layout, Select, Space, Modal, Form, Typography, Popover, Button, Flex, Spin, Collapse, Result} from "antd";
 import {Random} from "meteor/random";
 import {useTracker} from "meteor/react-meteor-data"
 import {useNavigate, useParams, useSearchParams} from "react-router-dom";
-import {PlusOutlined, GroupOutlined} from "@ant-design/icons";
+import {PlusOutlined, GroupOutlined, EditOutlined, CheckOutlined, CloseOutlined} from "@ant-design/icons";
 
 import './index.style.less'
 import Analysis from "./components/Analysis";
@@ -18,6 +18,7 @@ import MassAnalysisModal from "./components/MassAnalysisModal";
 import { GlobalSettingsProvider } from "../../../../contexts/GlobalSettingsContext";
 import GlobalSettingsPanel from "../Visualization/components/GlobalSettingsPanel";
 import MetadataTable from "../Visualization/components/MetadataTable";
+import {MAX_STUDY_NAME_LENGTH, canRenameStudy} from "../../../../../utils/studyName";
 
 // Lazy Analysis Component
 const LazyAnalysis = React.memo(({analysisId, inputType, sessionId, isActive, form, sessionInfo, exampleType}) => {
@@ -100,8 +101,35 @@ const {Title} = Typography;
 export default () => {
     // ALL HOOKS MUST BE DECLARED AT THE TOP - NO CONDITIONAL HOOKS
     const sessionId = useParams().sessionId;
-    const [searchParams] = useSearchParams();
-    const exampleType = searchParams.get('example'); // Get example parameter from URL
+    const routeAnalysisId = useParams().activeAnalysis;
+    const [searchParams, setSearchParams] = useSearchParams();
+    // ?example=<input type> is how the homepage demo boxes say "this analysis was just created for a
+    // demo, load that type's example data into it".
+    //
+    // Captured ONCE, in a state initializer, and stripped from the URL on mount. Reading it live
+    // would make it a standing instruction rather than a one-off, and it would keep applying: to a
+    // page reload, to Back/Forward, and — because onEdit awaits session.addAnalysis, which $sets
+    // activeAnalysis server-side BEFORE its own navigate() runs — to a second analysis added to the
+    // same study, which would briefly mount while the old query string was still in the URL.
+    // Capturing the analysis id alongside the type is what confines it to the analysis it was minted
+    // for. Nothing is lost by stripping: the URL carries a freshly created sessionId, so it was
+    // never a link anyone could share, and {replace: true} adds no history entry, so Back still
+    // returns to the homepage.
+    const [demoExample] = useState(() => ({
+        type: searchParams.get('example'),
+        analysisId: routeAnalysisId
+    }));
+
+    useEffect(() => {
+        if (!searchParams.has('example')) return;
+        setSearchParams((previous) => {
+            const next = new URLSearchParams(previous);
+            next.delete('example');
+            return next;
+        }, {replace: true});
+        // Mount-only on purpose: re-running on searchParams identity would fight any other
+        // query-string write on this page.
+    }, []);
     const [form] = Form.useForm();
     const navigate = useNavigate();
     const [isMassAnalysisModalOpen, setIsMassAnalysisModalOpen] = useState(false);
@@ -109,6 +137,11 @@ export default () => {
     const [groupedAnalyses, setGroupedAnalyses] = useState([]);
     const [openSettings, setOpenSettings] = useState(false);
     const [isSavingSettings, setIsSavingSettings] = useState(false);
+    // Inline rename of the study title. Mirrors the AI-report rename in AIInterpretation/index.jsx:
+    // a draft value, a saving flag that disables the controls, and notify on success/failure.
+    const [isRenaming, setIsRenaming] = useState(false);
+    const [renameValue, setRenameValue] = useState('');
+    const [renameSaving, setRenameSaving] = useState(false);
     const [analysisSettings, setAnalysisSettings] = useState({
         analysisId: '',
         inputType: '',
@@ -328,7 +361,7 @@ export default () => {
                     isActive={sessionInfo?.activeAnalysis === analysis.id}
                     form={form}
                     sessionInfo={sessionInfo}
-                    exampleType={exampleType}
+                    exampleType={demoExample.analysisId === analysis.id ? demoExample.type : null}
                 />
             )
         }));
@@ -360,7 +393,7 @@ export default () => {
                             isActive={sessionInfo?.activeAnalysis === analysis.id}
                             form={form}
                             sessionInfo={sessionInfo}
-                            exampleType={exampleType}
+                            exampleType={demoExample.analysisId === analysis.id ? demoExample.type : null}
                         />
                     )
                 }));
@@ -491,6 +524,50 @@ export default () => {
         return sessionInfo.activeAnalysis;
     }, [sessionInfo?.activeAnalysis, sessionInfo?.analyses, findAnalysisGroup]);
 
+    // The study page stays mounted when the URL moves to another study, so an open rename editor
+    // (and its draft) has to be dropped when sessionId changes — otherwise the next study opens
+    // showing the previous one's half-typed name. This reset is also what lets the render below
+    // gate on `isRenaming` alone: the editor can only ever be open for the study on screen.
+    const renamingSessionId = useRef(sessionId);
+    useEffect(() => {
+        renamingSessionId.current = sessionId;
+        setIsRenaming(false);
+        setRenameValue('');
+        setRenameSaving(false);
+    }, [sessionId]);
+
+    const startRename = useCallback(() => {
+        setRenameValue(sessionInfo?.name || '');
+        setIsRenaming(true);
+    }, [sessionInfo?.name]);
+
+    const cancelRename = useCallback(() => {
+        setIsRenaming(false);
+        setRenameValue('');
+    }, []);
+
+    const handleRenameSave = useCallback(async () => {
+        // Trim client-side too so the disabled-Save rule and what gets persisted agree; the server
+        // trims and re-validates regardless.
+        const name = renameValue.trim();
+        if (!name || renameSaving) return;
+        setRenameSaving(true);
+        try {
+            await Meteor.callAsync('session.rename', {sessionId, name});
+            window.notify?.success('Study renamed');
+            // The call captured its own sessionId, so it renames the right study even if the user
+            // navigated away mid-flight — but then the editor on screen belongs to a DIFFERENT
+            // study, and closing it here would discard that study's draft.
+            if (renamingSessionId.current !== sessionId) return;
+            setIsRenaming(false);
+            setRenameValue('');
+        } catch (error) {
+            window.notify?.error(error.reason || 'Failed to rename study');
+        } finally {
+            setRenameSaving(false);
+        }
+    }, [renameValue, renameSaving, sessionId]);
+
     // END OF HOOKS SECTION
 
     // Early return after all hooks are called.
@@ -527,13 +604,69 @@ export default () => {
 
     const configList = ['maxAdjustedPValue', 'minLogFoldChange'];
 
+    // Whether to OFFER the rename: a view-only import already returns above, and an expired study
+    // is judged by expiredAt — the same signal the Recent Studies list uses to withhold Edit and
+    // Share. This gates the entry point only. Once the editor is open it stays open: canRename
+    // re-evaluates Date.now() on every keystroke, and a study crossing its expiry mid-edit must not
+    // yank the field away and discard what was typed. (The server does not gate on expiry — no
+    // session mutation does — so an in-flight save still succeeds.)
+    const canRename = canRenameStudy(sessionInfo, Date.now());
+
     return (
         <GlobalSettingsProvider sessionId={sessionId}>
             <Layout className="analysis-page-wrapper">
                 <Helmet title={sessionInfo?.name}/>
-            <Title level={3}>
-                {sessionInfo?.name}
-            </Title>
+            <Flex align="center" gap={8} className="session-name">
+                {isRenaming ? (
+                    <>
+                        <Input
+                            value={renameValue}
+                            onChange={(e) => setRenameValue(e.target.value)}
+                            onPressEnter={handleRenameSave}
+                            onKeyDown={(e) => {
+                                // Escape is the way out; an edit field with no exit is a trap.
+                                if (e.key === 'Escape' && !renameSaving) cancelRename();
+                            }}
+                            placeholder="Study name"
+                            maxLength={MAX_STUDY_NAME_LENGTH}
+                            disabled={renameSaving}
+                            autoFocus
+                            className="session-name-input"
+                        />
+                        <Button
+                            type="primary"
+                            icon={<CheckOutlined/>}
+                            onClick={handleRenameSave}
+                            loading={renameSaving}
+                            disabled={!renameValue.trim()}
+                        >
+                            Save
+                        </Button>
+                        <Button
+                            icon={<CloseOutlined/>}
+                            onClick={cancelRename}
+                            disabled={renameSaving}
+                        >
+                            Cancel
+                        </Button>
+                    </>
+                ) : (
+                    <>
+                        <Title level={3}>
+                            {sessionInfo?.name}
+                        </Title>
+                        {canRename && (
+                            <Button
+                                type="text"
+                                icon={<EditOutlined/>}
+                                onClick={startRename}
+                                title="Rename study"
+                                aria-label="Rename study"
+                            />
+                        )}
+                    </>
+                )}
+            </Flex>
             <GlobalSettingsPanel />
             <Space direction="vertical" size="large" style={{width: '100%'}}>
                 <Flex justify="space-between" align="center">

@@ -21,7 +21,7 @@ Wilcoxon, PADOG, and PGSEA.
 pathway networks, Venn diagrams, forest charts, and funnel plots.
 - Meta-analysis, consensus analysis, and mass analysis (batch analysis of many datasets).
 - GEO import: load datasets directly from NCBI GEO by GSE accession.
-- AI-Powered Result Interpretation using a Large Language Model; interpretations can be exported as PDF or DOCX.
+- Biological Interpretation of results using a Large Language Model; interpretations can be exported as PDF or DOCX.
 - Study sharing: hand selected analyses to a colleague through an expiring link (see STUDY SHARING).
 
 STUDY SHARING
@@ -29,7 +29,7 @@ An owner shares a study by creating a link; the recipient uses that link to take
 - To share: go to Recent Studies, click Share on the study, tick the analyses to include, choose what \
 the recipient receives, set how long the link should last, click Create link, then copy the link and \
 send it to them.
-- "Results only" gives a view-only copy: results and AI reports, without the uploaded data. The \
+- "Results only" gives a view-only copy: results and biological interpretation reports, without the uploaded data. The \
 recipient can explore and export it, but cannot re-run or edit it.
 - "Everything" gives a full copy, including the uploaded data, which the recipient can re-run and edit.
 - Link expires after: between 1 and 90 days, 7 by default.
@@ -43,7 +43,7 @@ produced, and lets the owner extend, disable, or delete them.
 the address bar does NOT give anyone else access - the only way to share a study is a Share link.
 
 NAVIGATION
-Top menu: Home; Analysis (Recent Studies, Create Analysis, Create Mass Analysis); AI-interpretation; \
+Top menu: Home; Analysis (Recent Studies, Create Analysis, Create Mass Analysis); Biological Interpretation; \
 Tutorial; and Contact.
 
 INPUT TYPES

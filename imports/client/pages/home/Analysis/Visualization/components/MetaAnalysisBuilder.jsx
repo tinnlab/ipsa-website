@@ -1,5 +1,5 @@
 import React, {useEffect, useMemo, useState} from 'react';
-import {TreeSelect, Button, Table, Input, Select, Modal, Progress, Spin, message, Collapse, Checkbox} from 'antd';
+import {TreeSelect, Button, Table, Input, Select, Modal, Progress, Spin, message, Collapse, Checkbox, Tooltip, Typography, Alert} from 'antd';
 import {Random} from "meteor/random";
 import {useTracker} from "meteor/react-meteor-data";
 import useSubscription from "/imports/client/hooks/useSubscription";
@@ -8,8 +8,20 @@ import {Meteor} from "meteor/meteor";
 import GeneLoading from "../../../../../components/GeneLoading";
 import {analysisDisplayName, buildGeneLevelData} from "/imports/utils/metaAnalysisGeneLevel";
 import {useGlobalSettings} from "/imports/client/contexts/GlobalSettingsContext";
+import {
+    defaultPathwayCombination,
+    geneLevelCapability,
+    metaGeneLevelIncludedNote,
+    metaPathwayCombinationShortfallReason,
+    metaPathwayLevelIncludedNote,
+    META_MIN_ANALYSES,
+    META_NOTHING_AVAILABLE_TITLE,
+    pathwayCombinationCount,
+    pathwayLevelCapability,
+} from "/imports/utils/metaAnalysisLevels";
 
 const {SHOW_CHILD} = TreeSelect;
+const {Text} = Typography;
 const {Option} = Select;
 const {Panel} = Collapse;
 
@@ -44,6 +56,9 @@ export default ({configs, analyses, sessionId, resultGroupedDbAll: resultGrouped
     const [resultsByDb, setResultsByDb] = useState({});
     const [pathwayResultsData, setPathwayResultsData] = useState([]);
     const [initialDataLoaded, setInitialDataLoaded] = useState(false);
+    // Which levels this study can run, and why not. The level checkboxes are locked to these.
+    const [geneCapability, setGeneCapability] = useState({available: true, count: 0, reason: null});
+    const pathwayCapability = useMemo(() => pathwayLevelCapability(resultsByDb), [resultsByDb]);
 
     const methods = [
         {label: 'Fisher', value: 'fisher'},
@@ -92,8 +107,9 @@ export default ({configs, analyses, sessionId, resultGroupedDbAll: resultGrouped
 
     // Initialize gene-level data
     useEffect(() => {
-        // ONLY Expression analyses are eligible for gene-level meta-analysis (PGSEA's
-        // 2-column Gene+Statistic format lacks fold-change + p-value + standard errors).
+        // Expression analyses, and PGSEA analyses whose upload carried fold-change + p-value
+        // columns (their logFCSE is derived from FC and p), are eligible for gene-level
+        // meta-analysis; a single-metric PGSEA analysis shows disabled. See buildGeneLevelData.
         // Names are resolved from the config itself with a safe fallback, so an
         // Expression analysis present in `configs` but missing from `analyses` (e.g. it
         // has gene data but no pathway-enrichment results) does not crash the builder.
@@ -104,12 +120,23 @@ export default ({configs, analyses, sessionId, resultGroupedDbAll: resultGrouped
         setExpressionData(expressionData);
 
         // Auto-disable gene-level meta-analysis when nothing is runnable: either no
-        // Expression analyses at all (e.g. only PGSEA), or none of them have DE
+        // Expression/PGSEA analyses at all (e.g. only ORA), or none of them have DE
         // results yet (not run). initialSelectedItems holds only with-results ones.
-        if (initialSelectedItems.length === 0) {
-            setEnableGeneLevel(false);
-        }
+        // if (initialSelectedItems.length === 0) {
+        //     setEnableGeneLevel(false);
+        // }
+        // The level is now locked to its capability, which also needs at least TWO such analyses:
+        // checked when the study can run it, unchecked (with the reason shown) when it cannot.
+        const capability = geneLevelCapability(initialSelectedItems);
+        setGeneCapability(capability);
+        setEnableGeneLevel(capability.available);
     }, [configs, analyses]);
+
+    // Pathway level is locked to a static capability: some database + method pair has results for
+    // at least two analyses. It does not follow the dropdowns (see pathwayLevelCapability).
+    useEffect(() => {
+        setEnablePathwayLevel(pathwayCapability.available);
+    }, [pathwayCapability]);
 
     // Use pathway results from prop
     useEffect(() => {
@@ -154,11 +181,20 @@ export default ({configs, analyses, sessionId, resultGroupedDbAll: resultGrouped
         setAvailableEnrichmentMethods(Array.from(methodsSet));
 
         // Set default selections if not already set
-        if (!selectedDatabase && databases.length > 0) {
-            setSelectedDatabase(databases[0]);
+        // if (!selectedDatabase && databases.length > 0) {
+        //     setSelectedDatabase(databases[0]);
+        // }
+        // if (!selectedEnrichmentMethod && methodsSet.size > 0) {
+        //     setSelectedEnrichmentMethod(Array.from(methodsSet)[0]);
+        // }
+        // Start on a pair that at least two analyses share, so the locked-on pathway level does not
+        // open on a pair that cannot run. Falls back to the first database / first method as before.
+        const defaultCombination = defaultPathwayCombination(resultsByDb);
+        if (!selectedDatabase && defaultCombination.database) {
+            setSelectedDatabase(defaultCombination.database);
         }
-        if (!selectedEnrichmentMethod && methodsSet.size > 0) {
-            setSelectedEnrichmentMethod(Array.from(methodsSet)[0]);
+        if (!selectedEnrichmentMethod && defaultCombination.method) {
+            setSelectedEnrichmentMethod(defaultCombination.method);
         }
 
         let pathwayResData = {};
@@ -503,8 +539,38 @@ export default ({configs, analyses, sessionId, resultGroupedDbAll: resultGrouped
         return <GeneLoading />
     }
 
+    // The pathway checkbox does not follow the dropdowns; a chosen pair that cannot be pooled is
+    // reported under them instead, and the submit validation still blocks it.
+    const selectedCombinationCount = pathwayCombinationCount(resultsByDb, selectedDatabase, selectedEnrichmentMethod);
+    const pathwayCombinationShortfall = enablePathwayLevel && selectedDatabase && selectedEnrichmentMethod
+        && selectedCombinationCount < META_MIN_ANALYSES
+        ? metaPathwayCombinationShortfallReason(
+            selectedCombinationCount,
+            databaseNameMap[selectedDatabase] || selectedDatabase,
+            selectedEnrichmentMethod)
+        : null;
+
+    // Neither level can run: say so instead of rendering a builder whose every path ends in a submit
+    // error. Meta-analyses already in the study stay listed below.
+    const nothingAvailable = !geneCapability.available && !pathwayCapability.available;
+
     return (
         <div>
+            {nothingAvailable && (
+                <Alert
+                    type="info"
+                    showIcon
+                    style={{marginBottom: 16}}
+                    message={META_NOTHING_AVAILABLE_TITLE}
+                    description={
+                        <>
+                            <div>{geneCapability.reason}</div>
+                            <div>{pathwayCapability.reason}</div>
+                        </>
+                    }
+                />
+            )}
+            {!nothingAvailable && (<>
             <Input
                 placeholder="Enter meta analysis name"
                 value={analysisName}
@@ -520,13 +586,23 @@ export default ({configs, analyses, sessionId, resultGroupedDbAll: resultGrouped
                         key: 'gene',
                         label: (
                             <div>
-                                <Checkbox
-                                    checked={enableGeneLevel}
-                                    onChange={(e) => setEnableGeneLevel(e.target.checked)}
-                                    onClick={(e) => e.stopPropagation()}
-                                >
-                                    Gene-Level Meta-Analysis
-                                </Checkbox>
+                                {/* Locked to what the study can run; the tooltip says why. The span
+                                    lets the tooltip fire over a disabled checkbox. */}
+                                <Tooltip title={geneCapability.available ? metaGeneLevelIncludedNote(geneCapability.count) : geneCapability.reason}>
+                                    <span>
+                                        <Checkbox
+                                            checked={enableGeneLevel}
+                                            disabled
+                                            // onChange={(e) => setEnableGeneLevel(e.target.checked)}
+                                            onClick={(e) => e.stopPropagation()}
+                                        >
+                                            Gene-Level Meta-Analysis
+                                        </Checkbox>
+                                    </span>
+                                </Tooltip>
+                                {!geneCapability.available && (
+                                    <div><Text type="secondary">{geneCapability.reason}</Text></div>
+                                )}
                             </div>
                         ),
                         collapsible: enableGeneLevel ? undefined : 'disabled',
@@ -566,13 +642,21 @@ export default ({configs, analyses, sessionId, resultGroupedDbAll: resultGrouped
                         key: 'pathway',
                         label: (
                             <div>
-                                <Checkbox
-                                    checked={enablePathwayLevel}
-                                    onChange={(e) => setEnablePathwayLevel(e.target.checked)}
-                                    onClick={(e) => e.stopPropagation()}
-                                >
-                                    Pathway-Level Meta-Analysis
-                                </Checkbox>
+                                <Tooltip title={pathwayCapability.available ? metaPathwayLevelIncludedNote() : pathwayCapability.reason}>
+                                    <span>
+                                        <Checkbox
+                                            checked={enablePathwayLevel}
+                                            disabled
+                                            // onChange={(e) => setEnablePathwayLevel(e.target.checked)}
+                                            onClick={(e) => e.stopPropagation()}
+                                        >
+                                            Pathway-Level Meta-Analysis
+                                        </Checkbox>
+                                    </span>
+                                </Tooltip>
+                                {!pathwayCapability.available && (
+                                    <div><Text type="secondary">{pathwayCapability.reason}</Text></div>
+                                )}
                             </div>
                         ),
                         collapsible: enablePathwayLevel ? undefined : 'disabled',
@@ -637,6 +721,11 @@ export default ({configs, analyses, sessionId, resultGroupedDbAll: resultGrouped
                                     multiple
                                     disabled={!enablePathwayLevel}
                                 />
+                                {pathwayCombinationShortfall && (
+                                    <Text type="warning" style={{display: 'block', marginTop: 8}}>
+                                        {pathwayCombinationShortfall}
+                                    </Text>
+                                )}
                             </>
                         )
                     }
@@ -657,6 +746,7 @@ export default ({configs, analyses, sessionId, resultGroupedDbAll: resultGrouped
                     Create Meta-Analysis
                 </Button>
             )}
+            </>)}
 
             <Spin spinning={isMetaAnalysesLoading} tip="Loading meta analyses...">
                 <Table

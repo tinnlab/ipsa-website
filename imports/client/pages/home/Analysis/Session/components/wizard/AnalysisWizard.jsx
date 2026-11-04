@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Steps, Button, Space, Card, message as antdMessage } from 'antd';
 import { LeftOutlined, RightOutlined } from '@ant-design/icons';
 import Step1_InputTypeSelection from './Step1_InputTypeSelection';
@@ -11,6 +11,10 @@ import useSubscription from '../../../../../../hooks/useSubscription';
 
 const { Step } = Steps;
 
+// The input types the homepage demo boxes can ask for via ?example=. Kept as a whitelist so a
+// hand-typed or stale query string cannot steer the wizard's initial state.
+const EXAMPLE_INPUT_TYPES = ['ora', 'pgsea', 'expression'];
+
 const AnalysisWizard = ({ analysisId, sessionId, form, sessionInfo, exampleType }) => {
     const [currentStep, setCurrentStep] = useState(0);
     const [inputType, setInputType] = useState(null);
@@ -19,6 +23,14 @@ const AnalysisWizard = ({ analysisId, sessionId, form, sessionInfo, exampleType 
     const [resultsReady, setResultsReady] = useState(false);
     const [isEditing, setIsEditing] = useState(false);
     const [hasNavigated, setHasNavigated] = useState(false);
+    // "The demo example has been loaded into this analysis." The latch lives HERE and not in
+    // Step2_DataInput because renderStepContent() is a switch on currentStep: Step 2 unmounts the
+    // moment the user walks to Step 3 and a ref inside it would go with it. That matters — a user
+    // who clears the demo text to paste their own, steps forward and comes back would otherwise
+    // look like an empty analysis and have the demo written straight back over their intent.
+    // A ref rather than state: flipping it must not cause a render, and it is read inside an effect.
+    const exampleConsumedRef = useRef(false);
+    const isDemoExample = EXAMPLE_INPUT_TYPES.includes(exampleType);
 
     // Subscribe to analysis config data once inputType is known
     useSubscription(
@@ -30,7 +42,7 @@ const AnalysisWizard = ({ analysisId, sessionId, form, sessionInfo, exampleType 
             // so a key missing here is never delivered to Minimongo and every useTracker
             // reading it silently sees undefined. `inputRaw`/`rankingBy` back the PGSEA
             // ranking selector in Step 2.
-            keys: ["idType", "idTypes", "taxId", "input", "inputRaw", "rankingBy", "expressionFile", "groupFile", "groupData", "selectedControlSamples", "selectedConditionSamples", "selectedDatasets", "methodSettings", "volcanoPlotData", "maxAdjustedPValue", "minLogFoldChange"]
+            keys: ["idType", "idTypes", "taxId", "input", "inputRaw", "rankingBy", "fcScale", "expressionFile", "groupFile", "groupData", "selectedControlSamples", "selectedConditionSamples", "selectedDatasets", "methodSettings", "volcanoPlotData", "maxAdjustedPValue", "minLogFoldChange"]
         },
         [inputType, analysisId]
     );
@@ -86,6 +98,19 @@ const AnalysisWizard = ({ analysisId, sessionId, form, sessionInfo, exampleType 
             return;
         }
 
+        // A ?example= URL is minted by the homepage demo boxes for an analysis that was created
+        // moments ago with exactly that input type, so the type is known and the probe below has
+        // nothing to disambiguate. Skipping it is what lets the Gene List demo behave like the other
+        // two: for 'ora' the probe cannot tell a CHOSEN 'ora' from session.create's own default, so
+        // a brand-new demo fell through to "no config found" and parked on Step 1 with nothing
+        // selected, while the pgsea and expression demos went straight to Step 2.
+        if (isDemoExample) {
+            console.log('Demo example URL, trusting input type:', sessionInputType || exampleType);
+            setInputType(sessionInputType || exampleType);
+            setInitialStepSet(true);
+            return;
+        }
+
         if (sessionInputType && sessionInputType !== 'ora') {
             // Has a specific inputType that's not the default
             console.log('Detected input type from session:', sessionInputType);
@@ -129,7 +154,7 @@ const AnalysisWizard = ({ analysisId, sessionId, form, sessionInfo, exampleType 
             console.log('No input type in session, starting fresh');
             setInitialStepSet(true);
         }
-    }, [analysisId, initialStepSet, sessionData]);
+    }, [analysisId, initialStepSet, sessionData, isDemoExample, exampleType]);
 
     // Track analysis results to determine initial step
     const analysisResults = useTracker(() => {
@@ -466,6 +491,19 @@ const AnalysisWizard = ({ analysisId, sessionId, form, sessionInfo, exampleType 
                         inputType={inputType}
                         sessionId={sessionId}
                         onDataValidated={() => {}}
+                        // Everything only this component can see: the demo type matches the type
+                        // actually in use, the example has not been loaded yet for this analysis,
+                        // and the study is writable. Step 2 adds the one thing only it can see —
+                        // whether the stored input has arrived and is empty.
+                        // editable !== false rather than === true: the field is absent on some older
+                        // studies, and a missing flag has always meant writable here.
+                        shouldLoadExample={
+                            isDemoExample
+                            && exampleType === inputType
+                            && !exampleConsumedRef.current
+                            && sessionInfo?.editable !== false
+                        }
+                        onExampleConsumed={() => { exampleConsumedRef.current = true; }}
                     />
                 );
 

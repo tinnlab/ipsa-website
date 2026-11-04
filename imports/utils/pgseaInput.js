@@ -24,6 +24,7 @@
 //            magnitude -log10(clamp(P-value)), so the most-significant genes rank on top.
 
 import Papa from 'papaparse';
+import {derivePgseaLogFCSE} from './pgseaLogFCSE';
 
 // Smallest positive value we substitute for p <= 0 so -log10 stays finite
 // (-log10(1e-300) ≈ 300). Any p at or below this floor is treated as this floor;
@@ -42,6 +43,82 @@ export const RANKING_OPTIONS = [
   {value: 'fc', label: 'Fold Change'},
   {value: 'pval', label: 'Signed -log10(P-value)'},
 ];
+
+// The format a NEW upload must follow when `pgseaRequireStatsColumns` is on
+// (imports/utils/inputTypePolicy.js). Prefixed like every other normalizer error so callers that
+// swallow "unusable file" errors (buildPgseaVolcanoRows) keep recognising it.
+// export const PGSEA_STATS_FORMAT =
+//   'Gene<TAB>log2 Fold-Change<TAB>P-value (tab- or comma-separated; header optional, e.g. "gene\tlog2FC\tpvalue")';
+export const PGSEA_STATS_FORMAT =
+  'Gene<TAB>Fold-Change<TAB>P-value (tab- or comma-separated; header optional, e.g. "gene\tlog2FC\tpvalue")';
+export const PGSEA_STATS_FORMAT_ERROR =
+  `PGSEA Analysis: Expected 3 columns: ${PGSEA_STATS_FORMAT}. This file has no fold-change and p-value ` +
+  'columns that could be read.';
+
+// How the fold-change column is described next to the format, in the single-analysis wizard and
+// the input-type picker. Either scale is accepted; the user says which (see PGSEA_FC_SCALE_OPTIONS).
+export const PGSEA_FC_COLUMN_HELP =
+  'Column 2: fold change, either log2 fold change (signed, e.g. -1.8 / 2.5) or linear fold change ' +
+  '(ratio, all > 0, e.g. 0.29 / 5.7). Choose which one your file uses under "Fold-change column"; log2 is the default.';
+
+// Non-blocking. An observation, not a diagnosis: an all-positive column is a legitimate shape for an
+// up-regulated-only list, so the message must not claim the column IS linear fold change. Only
+// raised while the scale is log2 (the default); under 'linear' all-positive is expected.
+// export const PGSEA_LOG2_WARNING =
+//   'No negative values found in the fold-change column. Values must be log2 fold change; a column of ' +
+//   'linear fold changes (all > 0, centred on 1) will be interpreted incorrectly.';
+export const PGSEA_LOG2_WARNING =
+  'No negative values found in the fold-change column, which is being read as log2 fold change. If these ' +
+  'are linear fold changes (ratios, all > 0, centred on 1), set "Fold-change column" to Linear; if every ' +
+  'gene is genuinely up-regulated, leave it as log2.';
+
+// The scale of the fold-change column. Everything downstream (fgsea ranking, DEGenes / volcano FC,
+// gene-level meta-analysis direction, pooling and logFCSE weights, the 2^FC display) assumes log2,
+// so a 'linear' column is converted with log2() once, at the row level in normalizePgseaInput, and
+// every server-side re-parse of `inputRaw` is given the same stored `fcScale`. Never auto-detected:
+// an all-up-regulated log2 list is also all-positive and indistinguishable.
+export const PGSEA_FC_SCALES = ['log2', 'linear'];
+export const PGSEA_FC_SCALE_OPTIONS = [
+  {value: 'log2', label: 'log2 fold change'},
+  {value: 'linear', label: 'Linear fold change (ratio)'},
+];
+
+/** A stored or requested scale, with anything absent or unrecognised read as log2 (pre-existing analyses). */
+export const normalizePgseaFcScale = (value) => (value === 'linear' ? 'linear' : 'log2');
+
+/**
+ * The effective scale from an ordered list of candidates (highest priority first). Falsy and
+ * 'inherit' entries are skipped, so a mass-analysis per-dataset override → group → per-type
+ * default chain resolves exactly like the ranking choice does; nothing chosen means log2.
+ */
+export const resolvePgseaFcScale = (candidates) => {
+  const list = Array.isArray(candidates) ? candidates : [candidates];
+  return normalizePgseaFcScale(list.find((c) => c && c !== 'inherit'));
+};
+
+/**
+ * Convert parsed rows' fold changes to log2 when the column is linear. Pure; returns new rows.
+ * Under 'linear' a value <= 0 is not a ratio, so the whole input is rejected with the offending
+ * gene named rather than producing -Infinity / NaN. `fcRaw` is cleared on converted rows so
+ * buildPgseaContent emits the converted value instead of the original linear token.
+ *
+ * @param {Array<{gene: string, fc: number|null, pval: number|null, fcRaw: string|null}>} rows
+ * @param {'log2'|'linear'} fcScale
+ */
+export const applyPgseaFcScale = (rows, fcScale) => {
+  if (normalizePgseaFcScale(fcScale) !== 'linear') return rows;
+  return (rows ?? []).map((row, index) => {
+    if (row.fc == null) return row;
+    if (!(row.fc > 0)) {
+      throw new Error(
+        `PGSEA Analysis: The fold-change column is set to linear, but row ${index + 1} (gene ${row.gene}) has ` +
+        `fold change ${row.fcRaw ?? row.fc}. Linear fold changes must be greater than 0; if this column is ` +
+        'log2 fold change, set "Fold-change column" to log2.'
+      );
+    }
+    return {...row, fc: Math.log2(row.fc), fcRaw: null};
+  });
+};
 
 // A column header naming the gene/identifier column. ANCHORED on purpose: the previous
 // unanchored /gene|symbol/ also matched ordinary gene symbols (e.g. "GENE1" — the very
@@ -114,15 +191,25 @@ const firstContentLine = (text) => {
  * when the file has no usable gene/statistic structure at all, mirroring the
  * error contract callers (FileParser.parsePGSEAFiles) already rely on.
  *
+ * With `requireStats`, also throws PGSEA_STATS_FORMAT_ERROR unless the file yields rows carrying
+ * BOTH a fold-change and a p-value. Callers pass it only for NEW input, never when re-reading a
+ * stored analysis, so single-metric analyses saved before the requirement keep opening.
+ *
+ * With `fcScale: 'linear'` the fold-change column is converted to log2 (applyPgseaFcScale) before
+ * anything is derived from it, and a value <= 0 makes the input invalid. Absent means log2.
+ *
  * @param {string} text
- * @param {{rankingBy?: 'fc'|'pval'}} [opts]
+ * @param {{rankingBy?: 'fc'|'pval', requireStats?: boolean, fcScale?: 'log2'|'linear'}} [opts]
  * @returns {{
  *   rows: Array<{gene: string, fc: number|null, pval: number|null, fcRaw: string|null}>,
  *   available: Array<'fc'|'pval'>,
  *   rankingBy: 'fc'|'pval',
+ *   fcScale: 'log2'|'linear',
+ *   fcAllPositive: boolean,
  *   hadHeader: boolean,
  *   delimiter: string,
- *   content: string
+ *   content: string,
+ *   warnings: string[]
  * }}
  */
 export const normalizePgseaInput = (text, opts = {}) => {
@@ -308,7 +395,7 @@ export const normalizePgseaInput = (text, opts = {}) => {
   }
   // else: no header, exactly 2 columns → back-compat `Gene\tStatistic`, fcIdx = 1.
 
-  const rows = [];
+  const parsedRows = [];
   for (const parts of dataRows) {
     const gene = (parts[0] ?? '').trim();
     if (!gene) continue;
@@ -321,24 +408,46 @@ export const normalizePgseaInput = (text, opts = {}) => {
     // p-value-only file — a p-value (ranked as -log10(p)).
     if (fc == null && !(pvalOnly && pval != null)) continue;
 
-    rows.push({ gene, fc, pval, fcRaw: fcRawCell != null ? String(fcRawCell).trim() : null });
+    parsedRows.push({ gene, fc, pval, fcRaw: fcRawCell != null ? String(fcRawCell).trim() : null });
   }
 
-  if (rows.length === 0) {
+  if (parsedRows.length === 0) {
     throw new Error('PGSEA Analysis: No valid Gene/Statistic rows found after parsing.');
+  }
+
+  // Judged on the column AS UPLOADED (before any conversion): this is what drives the
+  // "is this linear?" prompt, so it must describe the user's file, not our derived values.
+  const fcAllPositive = parsedRows.some((r) => r.fc != null) && !parsedRows.some((r) => r.fc != null && r.fc < 0);
+  const fcScale = normalizePgseaFcScale(opts.fcScale);
+  const rows = pvalOnly ? parsedRows : applyPgseaFcScale(parsedRows, fcScale);
+
+  const hasStats = !pvalOnly && rows.some((r) => r.fc != null && r.pval != null);
+  if (opts.requireStats && !hasStats) {
+    throw new Error(PGSEA_STATS_FORMAT_ERROR);
   }
 
   const hasPval = pvalIdx != null && rows.some((r) => r.pval != null);
   const available = pvalOnly ? ['pval'] : hasPval ? ['fc', 'pval'] : ['fc'];
   const rankingBy = resolvePgseaRankingBy([opts.rankingBy], available);
 
+  // Only when the ranking column is read AS a fold change (a p-value sits beside it); a legacy
+  // single-metric file's column may be any statistic. Only under log2: a linear column is
+  // all-positive by definition.
+  const warnings = [];
+  if (hasStats && fcScale === 'log2' && fcAllPositive) {
+    warnings.push(PGSEA_LOG2_WARNING);
+  }
+
   return {
     rows,
     available,
     rankingBy,
+    fcScale,
+    fcAllPositive,
     hadHeader,
     delimiter,
     content: buildPgseaContent(rows, rankingBy),
+    warnings,
   };
 };
 
@@ -356,9 +465,23 @@ export const resolvePgseaRankingBy = (candidates, available = ['fc']) => {
   const list = Array.isArray(available) && available.length ? available : ['fc'];
   const ordered = Array.isArray(candidates) ? candidates : [candidates];
   const requested = ordered.find(Boolean);
-  // Clamp to what the file supports; fall back to the first available mode (which is
-  // 'pval' for a p-value-only file, 'fc' otherwise).
-  return requested && list.includes(requested) ? requested : list[0];
+  // Clamp to what the file supports; otherwise fall back to the file's default.
+  return requested && list.includes(requested) ? requested : defaultPgseaRankingBy(list);
+};
+
+/**
+ * The ranking a file gets when nobody chose one: signed -log10(P-value) whenever the file has a
+ * p-value column (it uses both the direction and the significance, the closest analogue of the
+ * moderated t that expression analyses rank by), Fold Change for a single-metric file.
+ *
+ * Stored analyses are unaffected: they carry their own `rankingBy`, which outranks this default.
+ *
+ * @param {Array<'fc'|'pval'>} available
+ * @returns {'fc'|'pval'}
+ */
+export const defaultPgseaRankingBy = (available = ['fc']) => {
+  const list = Array.isArray(available) && available.length ? available : ['fc'];
+  return list.includes('pval') ? 'pval' : list[0];
 };
 
 /**
@@ -455,7 +578,10 @@ export const parsePgseaGeneStats = (canonicalText) => {
  * need BOTH a fold-change and a p-value, so this reads the user's ORIGINAL upload: `input` has
  * been collapsed to a single ranking statistic and no longer carries p-values.
  *
- * @param {{inputRaw?: string, input?: string}} config
+ * `fcScale` is the analysis's stored scale (absent = log2): FC here becomes the DEGenes /
+ * volcano FC, the logFCSE input and the meta-analysis direction, so it must be log2.
+ *
+ * @param {{inputRaw?: string, input?: string, fcScale?: 'log2'|'linear'}} config
  * @returns {{pcaData: Array<{id: string, pValue: number, FC: number}>, skipped: string|null}}
  *   `skipped` is null when pcaData is usable; otherwise a reason the caller should no-op on.
  * @throws re-throws anything that is not the normalizer's own "unusable file" error
@@ -464,7 +590,8 @@ export const buildPgseaVolcanoRows = (config = {}) => {
   const source = config.inputRaw || config.input;
   let parsed;
   try {
-    parsed = normalizePgseaInput(source);
+    // parsed = normalizePgseaInput(source);
+    parsed = normalizePgseaInput(source, {fcScale: config.fcScale});
   } catch (e) {
     // Only swallow the normalizer's own errors; anything else is a real fault and must
     // surface rather than masquerade as "this file has no p-values".
@@ -491,6 +618,93 @@ export const buildPgseaVolcanoRows = (config = {}) => {
 };
 
 /**
+ * Benjamini-Hochberg adjusted p-values, in input order (same as R's p.adjust(method = 'fdr')).
+ * @param {number[]} pValues
+ * @returns {number[]}
+ */
+export const adjustPValuesBH = (pValues) => {
+  const n = pValues.length;
+  const indexed = pValues.map((p, i) => ({p, i})).sort((a, b) => a.p - b.p);
+  const adjusted = new Array(n);
+  let prev = 1;
+  for (let rank = n - 1; rank >= 0; rank--) {
+    const value = Math.min(indexed[rank].p * n / (rank + 1), prev);
+    adjusted[indexed[rank].i] = value;
+    prev = value;
+  }
+  return adjusted;
+};
+
+/**
+ * Turn the `{id, FC, pValue}` rows of a pgsea upload into the gene-level rows stored as BOTH
+ * `volcanoPlotData` and `DEGenes` (server/api/methods/analysis.js writePgseaDEGenes).
+ *
+ * NO significance filter, on purpose. For this input type the uploaded file IS the user's DE gene
+ * list, so the platform does not re-filter it; gene curation for an interpretation happens in the
+ * AI form's gene table. Expression analyses DO filter their DEGenes (ora.run.volcano.plot), because
+ * theirs are computed rather than supplied — this divergence is deliberate, do not "restore
+ * consistency" by adding a threshold here.
+ *
+ * - Rows whose p-value is not a probability (outside [0, 1]) are dropped: they are not statistics.
+ * - `pValueFDR` is BH over every remaining uploaded row, kept for display and the volcano.
+ * - `logFCSE` is derived from FC and the RAW p (imports/utils/pgseaLogFCSE.js), so gene-level
+ *   meta-analysis can weight the dataset.
+ * - With `mappedGeneIds` ({from: GeneID, to: uploaded id}, as getMappedGeneIds returns), `id`
+ *   becomes the GeneID — the id space expression rows and gene-level meta use — and `symbol`
+ *   keeps the uploaded identifier. Uploaded ids that map to nothing are dropped and counted. When
+ *   several uploaded rows map to one GeneID, the most significant one (smallest p) is kept; one
+ *   uploaded id mapping to several GeneIDs yields a row for each.
+ *
+ * @param {Array<{id: string, FC: number, pValue: number}>} pcaData
+ * @param {{mappedGeneIds?: Array<{from: string|number, to: string}>|null}} [opts]
+ *   pass null/omit mappedGeneIds when the uploaded ids already are GeneIDs
+ * @returns {{rows: Array<{id: string, symbol: string, FC: number, pValue: number,
+ *            pValueFDR: number, logFCSE: number}>, unmapped: number, invalidP: number}}
+ */
+export const buildPgseaGeneStatRows = (pcaData, {mappedGeneIds = null} = {}) => {
+  const valid = (pcaData || []).filter((r) =>
+    Number.isFinite(r.FC) && Number.isFinite(r.pValue) && r.pValue >= 0 && r.pValue <= 1);
+  const invalidP = (pcaData || []).length - valid.length;
+  const fdr = adjustPValuesBH(valid.map((r) => r.pValue));
+
+  const uploaded = valid.map((r, i) => ({
+    symbol: String(r.id),
+    FC: r.FC,
+    pValue: r.pValue,
+    pValueFDR: fdr[i],
+    logFCSE: derivePgseaLogFCSE(r.FC, r.pValue),
+  }));
+
+  if (!mappedGeneIds) {
+    return {rows: uploaded.map((r) => ({id: r.symbol, ...r})), unmapped: 0, invalidP};
+  }
+
+  const idsByUploaded = new Map();
+  for (const m of mappedGeneIds) {
+    if (m?.from == null || m?.to == null) continue;
+    const key = String(m.to);
+    if (!idsByUploaded.has(key)) idsByUploaded.set(key, new Set());
+    idsByUploaded.get(key).add(String(m.from));
+  }
+
+  const best = new Map();
+  let unmapped = 0;
+  for (const row of uploaded) {
+    const ids = idsByUploaded.get(row.symbol);
+    if (!ids || ids.size === 0) {
+      unmapped += 1;
+      continue;
+    }
+    for (const id of ids) {
+      const current = best.get(id);
+      if (!current || row.pValue < current.pValue) best.set(id, {id, ...row});
+    }
+  }
+
+  return {rows: [...best.values()], unmapped, invalidP};
+};
+
+/**
  * Rescue for files whose tabs arrived as the two literal characters `\` `t` rather than a
  * real tab. Applied ONLY after a parse attempt has already failed — the older
  * `text.includes('\\t') && !text.includes('\t')` guard fired on any comma-separated file
@@ -513,25 +727,39 @@ const applyLiteralTabFixup = (text) =>
  * through as `input`, which is what the single-analysis wizard stored before this change —
  * the advisory `data.validate` alert is what explains the problem to the user.
  *
+ * `requireStats` applies the 3-column requirement (see normalizePgseaInput). With it on, an `error`
+ * means the text must NOT be persisted — the caller keeps whatever was stored before.
+ *
+ * `fcScale` ('log2' | 'linear', absent = log2) is the user's declared fold-change scale. It is
+ * returned normalized so the caller persists it together with `input`; `inputRaw` is never
+ * rewritten — conversion is re-applied from the stored scale wherever the upload is re-parsed.
+ *
  * @param {string} rawText - exactly what the user uploaded or typed
- * @param {{storedRankingBy?: 'fc'|'pval', requestedRankingBy?: 'fc'|'pval'}} [opts]
+ * @param {{storedRankingBy?: 'fc'|'pval', requestedRankingBy?: 'fc'|'pval', requireStats?: boolean,
+ *          fcScale?: 'log2'|'linear'}} [opts]
  * @returns {{inputRaw: string, input: string, rankingBy: 'fc'|'pval'|null,
  *            available: Array<'fc'|'pval'>, hadHeader: boolean, isEmpty: boolean,
- *            error: string|null}}
+ *            error: string|null, warnings: string[], fcScale: 'log2'|'linear', fcAllPositive: boolean}}
  */
 export const derivePgseaPersistPayload = (rawText, opts = {}) => {
   const text = String(rawText ?? '');
+  const fcScale = normalizePgseaFcScale(opts.fcScale);
 
   if (!text.trim()) {
     return {
       inputRaw: '', input: '', rankingBy: null,
-      available: [], hadHeader: false, isEmpty: true, error: null,
+      available: [], hadHeader: false, isEmpty: true, error: null, warnings: [],
+      fcScale, fcAllPositive: false,
     };
   }
 
   const attempt = (candidate) => {
     try {
-      return {parsed: normalizePgseaInput(candidate), text: candidate, error: null};
+      return {
+        parsed: normalizePgseaInput(candidate, {requireStats: opts.requireStats, fcScale}),
+        text: candidate,
+        error: null
+      };
     } catch (e) {
       return {parsed: null, text: candidate, error: e?.message || String(e)};
     }
@@ -544,14 +772,27 @@ export const derivePgseaPersistPayload = (rawText, opts = {}) => {
   }
 
   if (!result.parsed) {
+    // A file that parses as log2 but not as linear has a value <= 0 under a declared linear
+    // scale. Unlike an unreadable file this must never be saved (not even verbatim): it would
+    // give a run whose fold changes cannot be converted. `scaleRejected` tells callers so.
+    let scaleRejected = false;
+    if (fcScale === 'linear') {
+      try {
+        normalizePgseaInput(result.text, {requireStats: opts.requireStats});
+        scaleRejected = true;
+      } catch (e) {
+        // unreadable regardless of scale — the ordinary error below stands
+      }
+    }
     // Unparseable — preserve the ORIGINAL text verbatim in both keys (pre-change behaviour).
     return {
       inputRaw: text, input: text, rankingBy: null,
-      available: [], hadHeader: false, isEmpty: false, error: result.error,
+      available: [], hadHeader: false, isEmpty: false, error: result.error, warnings: [],
+      fcScale, fcAllPositive: false, scaleRejected,
     };
   }
 
-  const {rows, available, hadHeader} = result.parsed;
+  const {rows, available, hadHeader, warnings, fcAllPositive} = result.parsed;
   const rankingBy = resolvePgseaRankingBy(
     [opts.requestedRankingBy, opts.storedRankingBy],
     available
@@ -566,5 +807,8 @@ export const derivePgseaPersistPayload = (rawText, opts = {}) => {
     hadHeader,
     isEmpty: false,
     error: null,
+    warnings,
+    fcScale,
+    fcAllPositive,
   };
 };

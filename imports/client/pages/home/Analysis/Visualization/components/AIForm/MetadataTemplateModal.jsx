@@ -152,7 +152,7 @@ export default function MetadataTemplateModal({
             title={
                 <Space>
                     <InfoCircleOutlined style={{ color: '#1890ff' }} />
-                    <span>Provide Biological Context for AI Interpretation</span>
+                    <span>Provide Biological Context for Interpretation</span>
                 </Space>
             }
             open={visible}
@@ -168,13 +168,13 @@ export default function MetadataTemplateModal({
                     onClick={handleSubmit}
                     disabled={!studyType}
                 >
-                    Continue with AI Interpretation
+                    Continue with Biological Interpretation
                 </Button>
             ]}
         >
             <Space direction="vertical" size="large" style={{ width: '100%' }}>
                 <Alert
-                    message="Biological context is required for AI interpretation"
+                    message="Biological context is required for interpretation"
                     description="The AI needs to understand your study design to provide accurate pathway interpretations. Select your study type and fill in the required fields."
                     type="info"
                     showIcon

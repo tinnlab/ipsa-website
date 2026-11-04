@@ -13,12 +13,22 @@ import {buildConsensusMethodColumns} from './consensusInput';
 import {resolveConsensusOptions} from '/imports/methods/consensusConfig';
 import {shouldRunConsensusForConfigDoc} from '/imports/methods/consensusTrigger';
 import {parseGroupData} from '/imports/utils/groupDataUtils';
-import {parsePgseaGeneStats, buildPgseaVolcanoRows} from '/imports/utils/pgseaInput';
+import {
+    parsePgseaGeneStats,
+    buildPgseaVolcanoRows,
+    buildPgseaGeneStatRows,
+    derivePgseaPersistPayload,
+    normalizePgseaFcScale,
+} from '/imports/utils/pgseaInput';
+import {resolveInputTypePolicy} from '/imports/utils/inputTypePolicy';
 import {rMetaMethodError} from '/imports/utils/rMetaMethods';
+import {collectAnalysisIds} from '/imports/utils/ownership';
+import {resolveAnalysisName} from '/imports/utils/analysisName';
 import path from "path";
 import Papa from 'papaparse';
 import {promises as fs} from 'fs';
 import {removeStudy, extendStudy} from '/server/startup/cron-job';
+import {renameStudy} from '/server/helper/renameStudy';
 import {
     assertAnalysisIdIsNew,
     assertOwnsAnalysis,
@@ -98,7 +108,7 @@ const getMappedGeneIdsFromGeneName = async ({ids, idType, taxId}) => {
     const batchSize = 350;
     const maxParallelRequests = 8;
     const delayBetweenParallelGroups = 1500;
-    const apiKey = Meteor.settings?.private?.PUBMED_API_KEY || process.env.NCBI_API_KEY || '';
+    const apiKey = 'db93e38dfc358e30807c66c5bd9fc927d608';
 
     // First collect all possible mappings for each gene symbol
     const allMappings = new Map(); // Maps gene symbol to array of possible gene IDs
@@ -1049,6 +1059,133 @@ const adjustPValues = (pValues) => {
     return adjusted;
 };
 
+// Server-side backstop for the pgseaRequireStatsColumns flag (imports/utils/inputTypePolicy.js):
+// NEW pgsea input must carry Gene / log2 Fold-Change / P-value. Only input that differs from what is
+// already stored is checked, so re-saving an existing single-metric analysis (the ranking radio, a
+// blur without edits, the reopen repair) keeps working; analysis.start never re-validates either.
+const assertPgseaInputAllowed = async ({analysisId, inputType, data}) => {
+    if (inputType !== 'pgsea' || !data || typeof data.input !== 'string' || !data.input.trim()) return
+    if (!resolveInputTypePolicy(Meteor.settings.private).pgseaRequireStatsColumns) return
+
+    const candidate = typeof data.inputRaw === 'string' && data.inputRaw.trim() ? data.inputRaw : data.input
+    const stored = await DBCollections.AnalysisConfig.find(
+        {analysisId, inputType, key: {$in: ['input', 'inputRaw']}}
+    ).fetchAsync()
+    const storedByKey = Object.fromEntries(stored.map(row => [row.key, row.value]))
+    const storedText = storedByKey.inputRaw ?? storedByKey.input
+    if (typeof storedText === 'string' && storedText.trim() === candidate.trim()) return
+
+    const {error} = derivePgseaPersistPayload(candidate, {requireStats: true})
+    if (error) {
+        throw new Meteor.Error('pgsea-input-invalid', error.replace(/^PGSEA Analysis:\s*/, ''))
+    }
+}
+
+// Server-side backstop for a declared linear fold-change scale (imports/utils/pgseaInput.js
+// applyPgseaFcScale). Independent of pgseaRequireStatsColumns: a linear column with a value <= 0
+// cannot be converted to log2, and saving it would hand every downstream reader -Infinity/NaN.
+// Checks the text and scale this update would leave stored, so changing either one is covered.
+const assertPgseaFcScaleAllowed = async ({analysisId, inputType, data}) => {
+    if (inputType !== 'pgsea' || !data) return
+    const touchesText = typeof data.inputRaw === 'string' || typeof data.input === 'string'
+    if (!touchesText && data.fcScale === undefined) return
+
+    const stored = await DBCollections.AnalysisConfig.find(
+        {analysisId, inputType, key: {$in: ['input', 'inputRaw', 'fcScale']}}
+    ).fetchAsync()
+    const storedByKey = Object.fromEntries(stored.map(row => [row.key, row.value]))
+    const fcScale = normalizePgseaFcScale(data.fcScale !== undefined ? data.fcScale : storedByKey.fcScale)
+    if (fcScale !== 'linear') return
+
+    const text = [data.inputRaw, storedByKey.inputRaw, data.input, storedByKey.input]
+        .find(t => typeof t === 'string' && t.trim())
+    if (!text) return
+    const {scaleRejected, error} = derivePgseaPersistPayload(text, {fcScale})
+    if (scaleRejected) {
+        throw new Meteor.Error('pgsea-fc-scale-invalid', error.replace(/^PGSEA Analysis:\s*/, ''))
+    }
+}
+
+// Gene-level statistics for a pgsea (ranked gene list with statistics) analysis, written to
+// AnalysisConfig as BOTH `volcanoPlotData` and `DEGenes` — the same row set. This is what lets a
+// pgsea dataset carry genes into the interpretation payload (aiWorkflow getDatasetGenes reads the
+// DEGenes snapshot) and into gene-level meta-analysis (which reads volcanoPlotData, logFCSE
+// included). analysis.start calls it before taking the snapshot, so single and mass runs alike get
+// one.
+//
+// DEGenes is deliberately NOT threshold-filtered, unlike expression's ora.run.volcano.plot. For this
+// input type the uploaded file IS the user's DE gene list, so the platform does not re-filter it;
+// expression filters because its DEGenes are computed. Do not add a filter here for consistency.
+// See buildPgseaGeneStatRows.
+//
+// Reads `inputRaw` (the original upload): `input` is collapsed to one ranking statistic. Returns
+// {skipped} for a file without fold-change AND p-value columns — every single-metric analysis
+// saved before the 3-column requirement — so those keep running, gene-less.
+const writePgseaDEGenes = async ({analysisId, inputType = 'pgsea', writeSnapshot = false}) => {
+    const configRows = await DBCollections.AnalysisConfig.find({
+        analysisId, inputType,
+        // fcScale: buildPgseaVolcanoRows converts a declared-linear column to log2 (absent = log2),
+        // so FC, the minLogFoldChange threshold, logFCSE and meta direction are all on log2.
+        key: {$in: ['input', 'inputRaw', 'fcScale', 'idType', 'taxId', 'maxAdjustedPValue', 'minLogFoldChange']}
+    }).fetchAsync()
+    const config = configRows.reduce((acc, cur) => {
+        acc[cur.key] = cur.value
+        return acc
+    }, {})
+
+    const write = async (key, value) => {
+        await DBCollections.AnalysisConfig.updateAsync({analysisId, inputType, key}, {$set: {value}}, {upsert: true})
+        if (writeSnapshot) {
+            await DBCollections.AnalysisConfigSnapshot.updateAsync({analysisId, inputType, key}, {$set: {value}}, {upsert: true})
+        }
+    }
+
+    // The volcano's display thresholds. Only defaulted when unset, so tuned values survive.
+    const setDefault = (key, value) =>
+        DBCollections.AnalysisConfig.updateAsync({analysisId, inputType, key}, {$set: {value}}, {upsert: true})
+    if (!config.maxAdjustedPValue) await setDefault('maxAdjustedPValue', 0.05)
+    if (!config.minLogFoldChange) await setDefault('minLogFoldChange', 0.5)
+
+    const {pcaData, skipped} = buildPgseaVolcanoRows(config)
+    if (skipped) return {skipped}
+
+    const idType = config.idType
+    let mappedGeneIds = null
+    if (idType !== 'GeneID' && idType !== 'NCBI_TaxID') {
+        if (!idType || config.taxId == null) return {skipped: 'no identifier type or organism to map genes with'}
+        mappedGeneIds = await getMappedGeneIds({
+            ids: _.uniq(pcaData.map(row => String(row.id))),
+            idType,
+            taxId: config.taxId
+        })
+        await write('mappedGeneIds', mappedGeneIds)
+    }
+
+    const {rows, unmapped, invalidP} = buildPgseaGeneStatRows(pcaData, {mappedGeneIds})
+    if (!rows.length) return {skipped: 'no uploaded gene could be mapped to a gene id'}
+
+    const geneInfo = await DBCollections.GeneInfo.find(
+        {_id: {$in: _.uniq(rows.map(row => row.id))}},
+        {fields: {symbol: 1, description: 1}}
+    ).fetchAsync()
+    const infoById = new Map(geneInfo.map(info => [String(info._id), info]))
+
+    const deGenes = rows.map(row => ({
+        _id: row.id,
+        FC: row.FC,
+        pValue: row.pValue,
+        pValueFDR: row.pValueFDR,
+        logFCSE: row.logFCSE,
+        symbol: infoById.get(row.id)?.symbol || row.symbol,
+        description: infoById.get(row.id)?.description || '',
+    }))
+
+    await write('volcanoPlotData', rows)
+    await write('DEGenes', deGenes)
+    console.log('writePgseaDEGenes', {analysisId, genes: rows.length, unmapped, invalidP})
+    return {skipped: null, genes: rows.length, unmapped, invalidP}
+}
+
 // Prepare volcanoPlotData for PGSEA (all genes for meta-analysis)
 // PGSEA now uses 2-column no-header format (Gene + Statistic only)
 // Volcano plots require both FC and p-value, which are not available in this format
@@ -1462,7 +1599,7 @@ const runExpressionAnalysis = async ({analysisConfigSnapshot, analysisId, inputT
 
 Meteor.methods({
     // 'analysis.create'
-    async 'session.create'({userId, name, inputType = 'ora'}) {
+    async 'session.create'({userId, name, inputType = 'ora', analysisName}) {
         // A study is always owned by the authenticated caller — require login FIRST (so the
         // logged-out path gets this clear message rather than a generic Match error), then
         // validate args, then never trust a client-supplied userId for another account (userId is
@@ -1472,6 +1609,9 @@ Meteor.methods({
         }
         check(userId, String);
         check(name, String);
+        // Optional. Absent is the overwhelmingly common case (the study modal and the Recent
+        // Studies page never pass it), so it is Match.Maybe rather than a required field.
+        check(analysisName, Match.Maybe(String));
         if (userId !== this.userId) {
             throw new Meteor.Error('not-authorized', 'You can only create studies for your own account.');
         }
@@ -1479,7 +1619,17 @@ Meteor.methods({
         const validInputTypes = ['ora', 'pgsea', 'expression'];
         const finalInputType = validInputTypes.includes(inputType) ? inputType : 'ora';
 
-        let analyses = [{id: Random.id(), name: 'Analysis', input: finalInputType}]
+        // The embedded analysis used to be hardcoded 'Analysis', so a study called
+        // "Demo - Expression Data Analysis" contained an analysis called "Analysis". Naming it here
+        // rather than renaming after creation is deliberate: there is no analysis.rename method, and
+        // the only alternative — session.updateAnalysis — replaces the WHOLE array element, so a
+        // caller that does not already hold every field silently drops the ones it did not send.
+        // One atomic create also removes the "study created, rename failed" state and the flicker of
+        // a tab that renders "Analysis" and then changes.
+        //
+        // resolveAnalysisName coerces and never throws, exactly as finalInputType above does, so the
+        // two callers that pass no analysisName produce a byte-identical document to before.
+        let analyses = [{id: Random.id(), name: resolveAnalysisName(analysisName), input: finalInputType}]
         let session = {
             _id: Random.id(),
             userId,
@@ -1519,6 +1669,14 @@ Meteor.methods({
         // get session name
         const session = await assertOwnsSession({sessionId, requesterUserId: this.userId})
         return session.name
+    },
+    async 'session.rename'({sessionId, name}) {
+        // Only the id is check()ed here — it reaches a selector. The name is left to renameStudy,
+        // which authorizes FIRST and then validates (type, trim, empty, max length), so a caller
+        // who may not touch this study never gets a verdict on their input. Same division as
+        // queue.updateBatchName, which leans on validateInsightName rather than check().
+        check(sessionId, String);
+        return await renameStudy({sessionId, requesterUserId: this.userId, name});
     },
     // analyses[] is authorization input — the ownership guards decide access by testing membership
     // of it — so these four are guarded here rather than with the rest of the mutations. Owning the
@@ -1615,6 +1773,8 @@ Meteor.methods({
         }
         console.log('analysis.update', analysisId, inputType)
         this.unblock()
+        await assertPgseaInputAllowed({analysisId, inputType, data})
+        await assertPgseaFcScaleAllowed({analysisId, inputType, data})
         await Promise.all(
             Object.keys(data).map(key => {
                 console.log('analysis.update', analysisId, inputType, key)
@@ -2012,6 +2172,65 @@ Meteor.methods({
 
         return customGeneSetId; // Return the ID for reference
     },
+    async 'session.get.custom.geneSets'({sessionId, analysisId}) {
+        // The custom gene sets of ONE study, for a caller that already holds an analysis in it.
+        //
+        // Why this exists: the AI-interpretation wizard's meta branch resolved pathway names and
+        // genes with `geneSet.getByIds`, which reads `GeneSet` — a collection custom gene sets are
+        // never written to. `geneSet.getByIds` is unguarded because `GeneSet` is public reference
+        // data (KEGG/GO/Reactome/MitoCarta imports); `SessionConfig` is per-user study data and
+        // that reasoning does NOT carry over, so this read is ownership-guarded.
+        //
+        // assertOwnsSessionAnalysis proves the caller owns the study AND that the analysis belongs
+        // to it. collectAnalysisIds covers metaAnalyses[], so a meta analysisId is valid here.
+        const session = await assertOwnsSessionAnalysis({
+            sessionId, analysisId, requesterUserId: this.userId
+        })
+
+        // BOTH sources, because neither alone is sufficient:
+        //
+        //  - A meta-analysis is created by meta.analysis.compute, which never calls analysis.start,
+        //    so the meta analysisId has NO customGeneSets snapshot of its own. An analysisId-scoped
+        //    read against the META id (the shape /api/customGeneSetsFull uses) comes back empty for
+        //    every meta-analysis there has ever been.
+        //  - The snapshots are the durable record: session.remove.custom.geneSets deletes the live
+        //    SessionConfig row, but a meta computed against that gene set still needs its names.
+        //
+        // The snapshots are reached through the study's OWN analysis ids rather than a sessionId
+        // selector. Two reasons, both load-bearing: AnalysisConfigSnapshot is indexed on
+        // {analysisId, key} and NOT on sessionId, so a session-scoped read would collection-scan a
+        // table whose rows include multi-hundred-kilobyte DEGenes arrays; and `sessionId` is only
+        // written by the customGeneSets snapshot insert, so most rows do not carry it at all.
+        // The ids come from the session the guard just proved the caller owns, so this is scoped by
+        // construction — never by a gene-set id the caller supplied.
+        const ownedAnalysisIds = collectAnalysisIds(session)
+
+        const live = await DBCollections.SessionConfig.find({
+            sessionId,
+            key: 'customGeneSets'
+        }).fetchAsync()
+        const snapshots = ownedAnalysisIds.length
+            ? await DBCollections.AnalysisConfigSnapshot.find({
+                analysisId: {$in: ownedAnalysisIds},
+                key: 'customGeneSets'
+            }).fetchAsync()
+            : []
+
+        // Deduplicate by the gene set's own id. A study that ran five analyses has five identical
+        // snapshot copies of each gene set, and one copy of MitoPathways3.0 is ~100KB of gene
+        // symbols — sending six of them over DDP to render one table would be absurd.
+        //
+        // Live rows are considered first so a rename is reflected rather than being overwritten by
+        // a frozen snapshot copy.
+        const byGeneSetId = new Map()
+        for (const row of [...live, ...snapshots]) {
+            const value = row && row.value
+            if (!value || typeof value !== 'object') continue
+            if (typeof value.id !== 'string' || value.id === '') continue
+            if (!byGeneSetId.has(value.id)) byGeneSetId.set(value.id, value)
+        }
+        return [...byGeneSetId.values()]
+    },
     async 'session.remove.custom.geneSets'({sessionId, customGeneSetId}) {
         // Ownership first: the removeAsync below keys on the gene-set id alone, so an unguarded
         // call deleted a custom gene set out of any user's study.
@@ -2100,6 +2319,27 @@ Meteor.methods({
             // Run inside the analysis context so every R subprocess spawned by
             // this analysis is tracked and can be killed by analysis.cancel.
             await analysisContext.run({analysisId}, async () => {
+            // pgsea: derive the gene-level rows from the upload BEFORE the snapshot below copies
+            // AnalysisConfig, so this run's snapshot carries them. A file without fold-change and
+            // p-value columns is skipped; any rows left from an earlier upload are then removed,
+            // because they describe a file that is no longer this analysis's input. A failure here
+            // must not fail the enrichment run: the interpretation gate refuses a gene-less analysis.
+            if (inputType === 'pgsea') {
+                let skipped
+                try {
+                    ({skipped} = await writePgseaDEGenes({analysisId, inputType}))
+                } catch (error) {
+                    console.error('analysis.start: pgsea gene-level statistics failed:', error)
+                    skipped = `failed: ${error.message}`
+                }
+                if (skipped) {
+                    console.log('analysis.start: no pgsea gene-level statistics —', skipped)
+                    await DBCollections.AnalysisConfig.removeAsync({
+                        analysisId, inputType, key: {$in: ['DEGenes', 'volcanoPlotData']}
+                    })
+                }
+            }
+
             // create a snapshot of the analysis config
             const analysisConfig = await DBCollections.AnalysisConfig.find({analysisId, inputType}).fetchAsync()
             const analysisConfigSnapshot = analysisConfig.reduce((acc, cur) => {
@@ -2491,7 +2731,11 @@ Meteor.methods({
             let fileName = path.join(Meteor.settings.private.tempDir, `${analysisId}_meta_analysis.rds`);
             let data = [];
             selectedExpressionData.forEach((analysis, i) => {
-                // For PGSEA analyses, use default sample size of 20 (10 per group) if not available
+                // For PGSEA analyses, use default sample size of 20 (10 per group) if not available.
+                // A pasted table has no sample counts; this only feeds REML's n.e. Their logFCSE
+                // is DERIVED from FC and the raw p (imports/utils/pgseaLogFCSE.js) — the
+                // inverse-variance pool below needs it, and drop_na() would silently discard
+                // every gene without one.
                 const isPgsea = analysis.inputType === 'pgsea';
                 const defaultSampleSize = 20;
                 const totalSampleSize = isPgsea
@@ -2564,7 +2808,8 @@ Meteor.methods({
 
             let inputType = 'metaDE';
             // Unlike the pathway-level result, we do NOT persist `method` here: every
-            // DE method produces a real per-gene standard error (logFCSE) and there is
+            // DE method produces a real per-gene standard error (logFCSE; for a pgsea input it
+            // is the SE derived from that dataset's FC and p) and there is
             // no gene-level funnel plot, so no consumer needs to branch on the method.
             await DBCollections.AnalysisConfig.updateAsync({
                 analysisId, inputType, key: 'volcanoPlotData', name
@@ -3042,154 +3287,11 @@ Meteor.methods({
         await assertWritableAnalysis({analysisId, requesterUserId: this.userId})
         console.log("pgsea.volcano.plot", {analysisId, inputType})
         this.unblock()
-
-        const analysisConfig = await DBCollections.AnalysisConfig.find({
-            analysisId, inputType,
-            key: {
-                // maxAdjustedPValue/minLogFoldChange must be listed or the defaulting block
-                // below reads them as undefined on every call and upserts 0.05/0.5 back over
-                // whatever thresholds the user had tuned.
-                $in: ['input', 'inputRaw', 'idType', 'taxId', 'mappedGeneIds',
-                      'maxAdjustedPValue', 'minLogFoldChange']
-            }
-        }).fetchAsync()
-
-        const analysisConfigSnapshot = analysisConfig.reduce((acc, cur) => {
-            acc[cur.key] = cur.value
-            return acc
-        }, {})
-
-        if (!analysisConfigSnapshot.maxAdjustedPValue) {
-            analysisConfigSnapshot.maxAdjustedPValue = 0.05
-            await DBCollections.AnalysisConfig.updateAsync({
-                analysisId, inputType, key: 'maxAdjustedPValue'
-            }, {
-                $set: {
-                    value: analysisConfigSnapshot.maxAdjustedPValue
-                }
-            }, {upsert: true});
-        }
-        if (!analysisConfigSnapshot.minLogFoldChange) {
-            analysisConfigSnapshot.minLogFoldChange = 0.5
-            await DBCollections.AnalysisConfig.updateAsync({
-                analysisId, inputType, key: 'minLogFoldChange'
-            }, {
-                $set: {
-                    value: analysisConfigSnapshot.minLogFoldChange
-                }
-            }, {upsert: true});
-        }
-
-        // DE genes need BOTH a fold-change and a p-value, so read the user's original upload
-        // (`inputRaw`) rather than `input` — the latter is the canonical 2-column
-        // `Gene\tStatistic` collapsed by the selected ranking, which no longer carries
-        // p-values. Falls back to `input` for analyses saved before inputRaw existed.
-        // normalizePgseaInput handles header/no-header, 2-or-3 columns and tab-or-comma, so
-        // the previous positional/exact-string column sniffing is no longer needed.
-        // Reads `inputRaw` (the user's original upload) rather than `input`, which has been
-        // collapsed to a single ranking statistic and no longer carries p-values. The parse and
-        // its three no-op exits live in /imports/utils/pgseaInput so they can be tested without
-        // a database — see tests/pgsea-input.tests.js. Returning early on `skipped` matters:
-        // falling through would overwrite existing DEGenes/volcanoPlotData (and the immutable
-        // snapshot) with empty arrays.
-        const {pcaData, skipped} = buildPgseaVolcanoRows(analysisConfigSnapshot)
-        if (skipped) {
-            console.log('pgsea.volcano.plot: skipping DE genes —', skipped)
-            return true
-        }
-
-        // Thresholds for DE gene filtering
-        const maxPValue = analysisConfigSnapshot.maxAdjustedPValue
-        const minFC = analysisConfigSnapshot.minLogFoldChange
-
-        let geneIdType = analysisConfigSnapshot.idType
-        const nameToIdMap = {}
-        let mappedGeneIds = analysisConfigSnapshot.mappedGeneIds || []
-
-        // Only perform gene ID mapping if not already cached
-        if (geneIdType !== 'GeneID' && geneIdType !== 'NCBI_TaxID' && mappedGeneIds.length === 0) {
-            console.log('pgsea.volcano.plot: Performing gene ID mapping for', pcaData.length, 'genes')
-            const geneIds = pcaData.map(geneData => geneData.id)
-            mappedGeneIds = await getMappedGeneIds({
-                ids: geneIds,
-                idType: geneIdType,
-                taxId: analysisConfigSnapshot.taxId
-            })
-
-            await DBCollections.AnalysisConfig.updateAsync({
-                analysisId, inputType, key: 'mappedGeneIds',
-            }, {
-                $set: {
-                    value: mappedGeneIds
-                }
-            }, {upsert: true});
-            await DBCollections.AnalysisConfigSnapshot.updateAsync({
-                analysisId, inputType, key: 'mappedGeneIds',
-            }, {
-                $set: {
-                    value: mappedGeneIds
-                }
-            }, {upsert: true});
-        } else if (mappedGeneIds.length > 0) {
-            console.log('pgsea.volcano.plot: Using cached gene ID mappings')
-        }
-
-        mappedGeneIds.forEach(item => {
-            nameToIdMap[item.to] = item.from
-        })
-
-        // Filter DE genes based on thresholds BEFORE fetching gene info
-        const deGenesFiltered = pcaData.filter(geneData =>
-            geneData.pValue < maxPValue && Math.abs(geneData.FC) > minFC
-        )
-        console.log('deGenes', deGenesFiltered.length, 'out of', pcaData.length, 'total genes')
-
-        // Only fetch gene info for DE genes, not all genes (huge performance improvement!)
-        const deGeneIds = geneIdType === 'GeneID' || geneIdType === 'NCBI_TaxID'
-            ? deGenesFiltered.map(geneData => geneData.id)
-            : deGenesFiltered.map(geneData => nameToIdMap[geneData.id] || geneData.id).filter(id => id)
-
-        let geneInfoData = deGeneIds.length > 0
-            ? await Meteor.callAsync("visualization.getGeneInfo", deGeneIds)
-            : []
-
-        const deGenes = deGenesFiltered.map(geneData => ({
-            _id: nameToIdMap[geneData.id] || geneData.id,
-            FC: geneData.FC,
-            symbol: geneData.id,
-            description: geneInfoData.find(gene => gene._id === (nameToIdMap[geneData.id] || geneData.id))?.description || '',
-        }))
-        await DBCollections.AnalysisConfig.updateAsync({
-            analysisId, inputType, key: 'DEGenes'
-        }, {
-            $set: {
-                value: deGenes
-            }
-        }, {upsert: true});
-
-        await DBCollections.AnalysisConfigSnapshot.updateAsync({
-            analysisId, inputType, key: 'DEGenes'
-        }, {
-            $set: {
-                value: deGenes
-            }
-        }, {upsert: true})
-
-        await DBCollections.AnalysisConfig.updateAsync({
-            analysisId, inputType, key: 'volcanoPlotData'
-        }, {
-            $set: {
-                value: pcaData
-            }
-        }, {upsert: true});
-
-        await DBCollections.AnalysisConfigSnapshot.updateAsync({
-            analysisId, inputType, key: 'volcanoPlotData'
-        }, {
-            $set: {
-                value: pcaData
-            }
-        }, {upsert: true});
+        // analysis.start now writes these on every pgsea run; this stays for callers that want
+        // to refresh them without re-running. A skipped file is a no-op, so existing rows are
+        // never overwritten with empty arrays.
+        const {skipped} = await writePgseaDEGenes({analysisId, inputType, writeSnapshot: true})
+        if (skipped) console.log('pgsea.volcano.plot: skipping DE genes —', skipped)
         console.log('pgsea.volcano.plot.done', {analysisId, inputType})
         return true;
     },
@@ -3388,7 +3490,7 @@ Return ONLY the JSON object, no markdown code blocks.`;
         // Build user message
         let user_message = '';
         if (is_sufficient) {
-            user_message = `Metadata is sufficient for AI interpretation (${completeness_level} level).`;
+            user_message = `Metadata is sufficient for biological interpretation (${completeness_level} level).`;
         } else {
             user_message = `Additional information needed: ${missing_critical.join(', ')}.`;
         }
@@ -4061,9 +4163,16 @@ async function configureAnalysisData(analysisId, analysis, finalConfig, individu
                 inputType,
                 data: {
                     // `content` is already ranked by the selected column client-side
-                    // (see MassAnalysisModal buildPgseaContent); this is metadata only.
+                    // (see MassAnalysisModal buildPgseaContent); rankingBy is metadata only.
+                    // `inputRaw` is the original file: analysis.start derives the gene-level
+                    // DE statistics from it, and analysis.update checks it against
+                    // pgseaRequireStatsColumns.
                     input: data.content,
+                    ...(typeof data.inputRaw === 'string' ? {inputRaw: data.inputRaw} : {}),
                     rankingBy: data.rankingBy || 'fc',
+                    // The declared fold-change scale `content` was built with; analysis.start
+                    // re-parses inputRaw with it for the gene-level statistics.
+                    fcScale: normalizePgseaFcScale(data.fcScale),
                     taxId: appliedConfig.organism
                 }
             });
